@@ -1,5 +1,6 @@
 //
-// Copyright (c) 2026
+// Copyright (c) 2010-2026 Antmicro
+// Copyright (c) 2026 Alexey Zagorodnikov <xglooom@gmail.com>
 //
 // This file is licensed under the MIT License.
 // Full license text is available in 'licenses/MIT.txt'.
@@ -17,7 +18,7 @@ using Antmicro.Renode.Time;
 
 namespace Antmicro.Renode.Peripherals.DMA
 {
-    // MPC5645S/PXD20 eDMA subset used by the IPC renderer.
+    // MPC5645S/PXD20 eDMA subset.
     //
     // The model implements the classic 16-channel, big-endian TCD layout at
     // 0x1000 + channel*0x20, command registers, always-request DMAMUX sources,
@@ -56,6 +57,39 @@ namespace Antmicro.Renode.Peripherals.DMA
             }
             Error = new GPIO();
             Reset();
+        }
+
+        public bool IsChannelActive(int channel)
+        {
+            return IsValidChannel(channel) && channels[channel].Active;
+        }
+
+        public bool IsInterruptPending(int channel)
+        {
+            return IsValidChannel(channel) && (ReadRawDoubleWord(InterruptRequestOffset) & (1u << channel)) != 0;
+        }
+
+        public ulong GetChannelCompletionCount(int channel)
+        {
+            return IsValidChannel(channel) ? channelCompletionCounts[channel] : 0;
+        }
+
+        public uint GetMuxConfiguration(int channel)
+        {
+            return IsValidChannel(channel) ? muxConfiguration[channel] : 0u;
+        }
+
+        public void SetMuxConfiguration(int channel, byte value)
+        {
+            if(!IsValidChannel(channel))
+            {
+                return;
+            }
+            lock(sync)
+            {
+                muxConfiguration[channel] = value;
+                EvaluateChannel(channel);
+            }
         }
 
         public void Reset()
@@ -163,37 +197,51 @@ namespace Antmicro.Renode.Peripherals.DMA
 
         public uint LastErrorReasonCode { get; private set; }
 
-        public bool IsChannelActive(int channel)
+        private static bool IsAlwaysRequest(byte configuration)
         {
-            return IsValidChannel(channel) && channels[channel].Active;
+            var enabled = (configuration & DmaMuxEnableMask) != 0;
+            var triggered = (configuration & DmaMuxTriggerMask) != 0;
+            var source = configuration & DmaMuxSourceMask;
+            return enabled && !triggered && source >= FirstAlwaysRequestSource;
         }
 
-        public bool IsInterruptPending(int channel)
+        private static int SignExtendMinorOffset(uint value)
         {
-            return IsValidChannel(channel) && (ReadRawDoubleWord(InterruptRequestOffset) & (1u << channel)) != 0;
+            return (int)(value << 2) >> 12;
         }
 
-        public ulong GetChannelCompletionCount(int channel)
+        private static uint AddSigned(uint value, int adjustment)
         {
-            return IsValidChannel(channel) ? channelCompletionCounts[channel] : 0;
+            return unchecked(value + (uint)adjustment);
         }
 
-        public uint GetMuxConfiguration(int channel)
+        private static bool IsValidChannel(int channel)
         {
-            return IsValidChannel(channel) ? muxConfiguration[channel] : 0u;
+            return channel >= 0 && channel < ChannelCount;
         }
 
-        public void SetMuxConfiguration(int channel, byte value)
+        private static bool IsValidRange(long offset, int size)
         {
-            if(!IsValidChannel(channel))
-            {
-                return;
-            }
-            lock(sync)
-            {
-                muxConfiguration[channel] = value;
-                EvaluateChannel(channel);
-            }
+            return (size == 1 || size == 2 || size == 4)
+                && offset >= 0 && offset <= SizeValue - size;
+        }
+
+        private static bool Overlaps(long offset, int size, long registerOffset, int registerSize)
+        {
+            return offset < registerOffset + registerSize && registerOffset < offset + size;
+        }
+
+        private static long TcdOffset(int channel)
+        {
+            return TcdBaseOffset + channel * TcdStride;
+        }
+
+        private static void ArmTimer(LimitTimer timer, ulong ticks)
+        {
+            timer.Enabled = false;
+            timer.Limit = ticks;
+            timer.Value = ticks;
+            timer.Enabled = true;
         }
 
         private uint ReadSized(long offset, int size)
@@ -293,38 +341,38 @@ namespace Antmicro.Renode.Peripherals.DMA
                 var bit = 1u << channel;
                 switch(offset)
                 {
-                    case SetEnableRequestOffset:
-                        WriteRawDoubleWord(EnableRequestOffset, ReadRawDoubleWord(EnableRequestOffset) | bit);
-                        EvaluateChannel(channel);
-                        break;
-                    case ClearEnableRequestOffset:
-                        WriteRawDoubleWord(EnableRequestOffset, ReadRawDoubleWord(EnableRequestOffset) & ~bit);
-                        break;
-                    case SetEnableErrorInterruptOffset:
-                        WriteRawDoubleWord(EnableErrorInterruptOffset, ReadRawDoubleWord(EnableErrorInterruptOffset) | bit);
-                        UpdateInterrupts();
-                        break;
-                    case ClearEnableErrorInterruptOffset:
-                        WriteRawDoubleWord(EnableErrorInterruptOffset, ReadRawDoubleWord(EnableErrorInterruptOffset) & ~bit);
-                        UpdateInterrupts();
-                        break;
-                    case ClearInterruptRequestOffset:
-                        WriteRawDoubleWord(InterruptRequestOffset, ReadRawDoubleWord(InterruptRequestOffset) & ~bit);
-                        UpdateInterrupts();
-                        break;
-                    case ClearErrorRequestOffset:
-                        WriteRawDoubleWord(ErrorRequestOffset, ReadRawDoubleWord(ErrorRequestOffset) & ~bit);
-                        UpdateInterrupts();
-                        break;
-                    case SetStartOffset:
-                        WriteRawWord(TcdOffset(channel) + TcdControlStatusOffset,
-                            (ushort)(ReadRawWord(TcdOffset(channel) + TcdControlStatusOffset) | ChannelStartMask));
-                        EvaluateChannel(channel);
-                        break;
-                    case ClearDoneOffset:
-                        WriteRawWord(TcdOffset(channel) + TcdControlStatusOffset,
-                            (ushort)(ReadRawWord(TcdOffset(channel) + TcdControlStatusOffset) & ~ChannelDoneMask));
-                        break;
+                case SetEnableRequestOffset:
+                    WriteRawDoubleWord(EnableRequestOffset, ReadRawDoubleWord(EnableRequestOffset) | bit);
+                    EvaluateChannel(channel);
+                    break;
+                case ClearEnableRequestOffset:
+                    WriteRawDoubleWord(EnableRequestOffset, ReadRawDoubleWord(EnableRequestOffset) & ~bit);
+                    break;
+                case SetEnableErrorInterruptOffset:
+                    WriteRawDoubleWord(EnableErrorInterruptOffset, ReadRawDoubleWord(EnableErrorInterruptOffset) | bit);
+                    UpdateInterrupts();
+                    break;
+                case ClearEnableErrorInterruptOffset:
+                    WriteRawDoubleWord(EnableErrorInterruptOffset, ReadRawDoubleWord(EnableErrorInterruptOffset) & ~bit);
+                    UpdateInterrupts();
+                    break;
+                case ClearInterruptRequestOffset:
+                    WriteRawDoubleWord(InterruptRequestOffset, ReadRawDoubleWord(InterruptRequestOffset) & ~bit);
+                    UpdateInterrupts();
+                    break;
+                case ClearErrorRequestOffset:
+                    WriteRawDoubleWord(ErrorRequestOffset, ReadRawDoubleWord(ErrorRequestOffset) & ~bit);
+                    UpdateInterrupts();
+                    break;
+                case SetStartOffset:
+                    WriteRawWord(TcdOffset(channel) + TcdControlStatusOffset,
+                        (ushort)(ReadRawWord(TcdOffset(channel) + TcdControlStatusOffset) | ChannelStartMask));
+                    EvaluateChannel(channel);
+                    break;
+                case ClearDoneOffset:
+                    WriteRawWord(TcdOffset(channel) + TcdControlStatusOffset,
+                        (ushort)(ReadRawWord(TcdOffset(channel) + TcdControlStatusOffset) & ~ChannelDoneMask));
+                    break;
                 }
             }
         }
@@ -699,14 +747,6 @@ namespace Antmicro.Renode.Peripherals.DMA
             }
         }
 
-        private static bool IsAlwaysRequest(byte configuration)
-        {
-            var enabled = (configuration & DmaMuxEnableMask) != 0;
-            var triggered = (configuration & DmaMuxTriggerMask) != 0;
-            var source = configuration & DmaMuxSourceMask;
-            return enabled && !triggered && source >= FirstAlwaysRequestSource;
-        }
-
         private uint DecodeMinorByteCount(uint value)
         {
             if((ReadRawDoubleWord(ControlOffset) & EnableMinorLoopMappingMask) == 0)
@@ -716,37 +756,6 @@ namespace Antmicro.Renode.Peripherals.DMA
             return (value & MinorLoopOffsetEnableMask) != 0
                 ? value & MinorByteCountWithOffsetMask
                 : value & MinorByteCountWithoutOffsetMask;
-        }
-
-        private static int SignExtendMinorOffset(uint value)
-        {
-            return (int)(value << 2) >> 12;
-        }
-
-        private static uint AddSigned(uint value, int adjustment)
-        {
-            return unchecked(value + (uint)adjustment);
-        }
-
-        private static bool IsValidChannel(int channel)
-        {
-            return channel >= 0 && channel < ChannelCount;
-        }
-
-        private static bool IsValidRange(long offset, int size)
-        {
-            return (size == 1 || size == 2 || size == 4)
-                && offset >= 0 && offset <= SizeValue - size;
-        }
-
-        private static bool Overlaps(long offset, int size, long registerOffset, int registerSize)
-        {
-            return offset < registerOffset + registerSize && registerOffset < offset + size;
-        }
-
-        private static long TcdOffset(int channel)
-        {
-            return TcdBaseOffset + channel * TcdStride;
         }
 
         private ushort ReadRawWord(long offset)
@@ -776,13 +785,86 @@ namespace Antmicro.Renode.Peripherals.DMA
             registers[offset + 3] = (byte)value;
         }
 
-        private static void ArmTimer(LimitTimer timer, ulong ticks)
-        {
-            timer.Enabled = false;
-            timer.Limit = ticks;
-            timer.Value = ticks;
-            timer.Enabled = true;
-        }
+        private volatile MemoryEntry[] memoryMap;
+
+        private readonly ulong[] channelCompletionCounts;
+        private readonly byte[] muxConfiguration;
+        private readonly Dictionary<int, IGPIO> connections;
+        private readonly ChannelState[] channels;
+        private readonly IBusController systemBus;
+        private readonly IMachine machine;
+
+        private readonly object sync = new object();
+        private readonly byte[] registers;
+        private const ushort IterationLinkMask = 1 << 15;
+        private const ushort ChannelDoneMask = 1 << 7;
+        private const ushort ChannelActiveMask = 1 << 6;
+        private const ushort EnableMajorLinkMask = 1 << 5;
+        private const ushort EnableScatterGatherMask = 1 << 4;
+        private const ushort DisableRequestMask = 1 << 3;
+        private const ushort ChannelStartMask = 1 << 0;
+        private const ushort InterruptMajorMask = 1 << 1;
+        private const uint EnableMinorLoopMappingMask = 1u << 7;
+
+        private const uint HaltMask = 1u << 5;
+        private const long TcdControlStatusOffset = 0x1E;
+        private const long TcdBeginningIterationOffset = 0x1C;
+        private const ushort InterruptHalfMask = 1 << 2;
+        private const ushort IterationCountMask = 0x7FFF;
+        private const uint SourceMinorLoopOffsetEnableMask = 0x80000000;
+
+        private const byte CommandNoOperationMask = 1 << 7;
+        private const byte CommandAllChannelsMask = 1 << 6;
+        private const byte CommandChannelMask = 0x3F;
+        private const byte DmaMuxEnableMask = 1 << 7;
+        private const byte DmaMuxTriggerMask = 1 << 6;
+        private const byte DmaMuxSourceMask = 0x3F;
+        private const byte FirstAlwaysRequestSource = 56;
+
+        private const uint MinorLoopOffsetEnableMask = 0xC0000000;
+        private const long TcdDestinationLastAdjustmentOffset = 0x18;
+        private const uint DestinationMinorLoopOffsetEnableMask = 0x40000000;
+        private const uint MinorByteCountWithOffsetMask = 0x3FF;
+        private const uint MinorByteCountWithoutOffsetMask = 0x3FFFFFFF;
+
+        private const uint ErrorInvalidGeometry = 1;
+        private const ushort UnsupportedModuloMask = 0xF8F8;
+        private const long TcdDestinationOffsetOffset = 0x16;
+        private const long InterruptRequestOffset = 0x24;
+        private const long TcdDestinationAddressOffset = 0x10;
+
+        private const int ChannelCount = 16;
+        private const int SizeValue = 0x4000;
+        private const ulong DefaultTransferFrequency = 40000000;
+        private const ulong FixedLatencyTicks = 16;
+        private const ulong MaximumTimerTicks = 1UL << 32;
+        private const uint MaximumMinorByteCount = 0x100000;
+        private const int MaximumTransferSizeCode = 5;
+
+        private const long ControlOffset = 0x00;
+        private const long EnableRequestOffset = 0x0C;
+        private const long EnableErrorInterruptOffset = 0x14;
+        private const long CommandBaseOffset = 0x18;
+        private const long SetEnableRequestOffset = 0x18;
+        private const long ClearEnableRequestOffset = 0x19;
+        private const long SetEnableErrorInterruptOffset = 0x1A;
+        private const long ClearEnableErrorInterruptOffset = 0x1B;
+        private const long ClearInterruptRequestOffset = 0x1C;
+        private const long ClearErrorRequestOffset = 0x1D;
+        private const long SetStartOffset = 0x1E;
+        private const long ClearDoneOffset = 0x1F;
+        private const long CommandEndOffset = 0x20;
+        private const uint ErrorUnmappedOrPeripheralAddress = 2;
+        private const long ErrorRequestOffset = 0x2C;
+        private const long TcdBaseOffset = 0x1000;
+        private const int TcdStride = 0x20;
+        private const long TcdSourceAddressOffset = 0x00;
+        private const long TcdAttributesOffset = 0x04;
+        private const long TcdSourceOffsetOffset = 0x06;
+        private const long TcdNBytesOffset = 0x08;
+        private const long TcdSourceLastAdjustmentOffset = 0x0C;
+        private const long TcdCurrentIterationOffset = 0x14;
+        private const uint ErrorUnsupportedConfiguration = 3;
 
         private sealed class ChannelState
         {
@@ -815,85 +897,6 @@ namespace Antmicro.Renode.Peripherals.DMA
             public ulong End;
             public MappedMemory Memory;
         }
-
-        private readonly object sync = new object();
-        private readonly IMachine machine;
-        private readonly IBusController systemBus;
-        private volatile MemoryEntry[] memoryMap;
-        private readonly byte[] registers;
-        private readonly ChannelState[] channels;
-        private readonly Dictionary<int, IGPIO> connections;
-        private readonly byte[] muxConfiguration;
-        private readonly ulong[] channelCompletionCounts;
-
-        private const int ChannelCount = 16;
-        private const int SizeValue = 0x4000;
-        private const ulong DefaultTransferFrequency = 40000000;
-        private const ulong FixedLatencyTicks = 16;
-        private const ulong MaximumTimerTicks = 1UL << 32;
-        private const uint MaximumMinorByteCount = 0x100000;
-        private const int MaximumTransferSizeCode = 5;
-
-        private const long ControlOffset = 0x00;
-        private const long EnableRequestOffset = 0x0C;
-        private const long EnableErrorInterruptOffset = 0x14;
-        private const long CommandBaseOffset = 0x18;
-        private const long SetEnableRequestOffset = 0x18;
-        private const long ClearEnableRequestOffset = 0x19;
-        private const long SetEnableErrorInterruptOffset = 0x1A;
-        private const long ClearEnableErrorInterruptOffset = 0x1B;
-        private const long ClearInterruptRequestOffset = 0x1C;
-        private const long ClearErrorRequestOffset = 0x1D;
-        private const long SetStartOffset = 0x1E;
-        private const long ClearDoneOffset = 0x1F;
-        private const long CommandEndOffset = 0x20;
-        private const long InterruptRequestOffset = 0x24;
-        private const long ErrorRequestOffset = 0x2C;
-        private const long TcdBaseOffset = 0x1000;
-        private const int TcdStride = 0x20;
-        private const long TcdSourceAddressOffset = 0x00;
-        private const long TcdAttributesOffset = 0x04;
-        private const long TcdSourceOffsetOffset = 0x06;
-        private const long TcdNBytesOffset = 0x08;
-        private const long TcdSourceLastAdjustmentOffset = 0x0C;
-        private const long TcdDestinationAddressOffset = 0x10;
-        private const long TcdCurrentIterationOffset = 0x14;
-        private const long TcdDestinationOffsetOffset = 0x16;
-        private const long TcdDestinationLastAdjustmentOffset = 0x18;
-        private const long TcdBeginningIterationOffset = 0x1C;
-        private const long TcdControlStatusOffset = 0x1E;
-
-        private const uint HaltMask = 1u << 5;
-        private const uint EnableMinorLoopMappingMask = 1u << 7;
-        private const ushort ChannelStartMask = 1 << 0;
-        private const ushort InterruptMajorMask = 1 << 1;
-        private const ushort InterruptHalfMask = 1 << 2;
-        private const ushort DisableRequestMask = 1 << 3;
-        private const ushort EnableScatterGatherMask = 1 << 4;
-        private const ushort EnableMajorLinkMask = 1 << 5;
-        private const ushort ChannelActiveMask = 1 << 6;
-        private const ushort ChannelDoneMask = 1 << 7;
-        private const ushort IterationLinkMask = 1 << 15;
-        private const ushort IterationCountMask = 0x7FFF;
-        private const ushort UnsupportedModuloMask = 0xF8F8;
-
-        private const byte CommandNoOperationMask = 1 << 7;
-        private const byte CommandAllChannelsMask = 1 << 6;
-        private const byte CommandChannelMask = 0x3F;
-        private const byte DmaMuxEnableMask = 1 << 7;
-        private const byte DmaMuxTriggerMask = 1 << 6;
-        private const byte DmaMuxSourceMask = 0x3F;
-        private const byte FirstAlwaysRequestSource = 56;
-
-        private const uint MinorLoopOffsetEnableMask = 0xC0000000;
-        private const uint SourceMinorLoopOffsetEnableMask = 0x80000000;
-        private const uint DestinationMinorLoopOffsetEnableMask = 0x40000000;
-        private const uint MinorByteCountWithOffsetMask = 0x3FF;
-        private const uint MinorByteCountWithoutOffsetMask = 0x3FFFFFFF;
-
-        private const uint ErrorInvalidGeometry = 1;
-        private const uint ErrorUnmappedOrPeripheralAddress = 2;
-        private const uint ErrorUnsupportedConfiguration = 3;
     }
 
     public sealed class MPC5645S_DMAMUX : IDoubleWordPeripheral, IWordPeripheral,
@@ -904,31 +907,6 @@ namespace Antmicro.Renode.Peripherals.DMA
             this.dma = dma ?? throw new ArgumentNullException(nameof(dma));
             channels = new byte[ChannelCount];
             Reset();
-        }
-
-        public void Reset()
-        {
-            requestPropagationEnabled = true;
-            for(var channel = 0; channel < ChannelCount; channel++)
-            {
-                channels[channel] = 0;
-                dma.SetMuxConfiguration(channel, 0);
-            }
-        }
-
-        // Host-side diagnostic control for matched disabled/working tests.
-        // It is not guest-visible and defaults to normal hardware propagation.
-        public bool RequestPropagationEnabled
-        {
-            get => requestPropagationEnabled;
-            set
-            {
-                requestPropagationEnabled = value;
-                for(var channel = 0; channel < ChannelCount; channel++)
-                {
-                    dma.SetMuxConfiguration(channel, value ? channels[channel] : (byte)0);
-                }
-            }
         }
 
         public uint ReadDoubleWord(long offset)
@@ -961,7 +939,38 @@ namespace Antmicro.Renode.Peripherals.DMA
             WriteSized(offset, 1, value);
         }
 
+        public void Reset()
+        {
+            requestPropagationEnabled = true;
+            for(var channel = 0; channel < ChannelCount; channel++)
+            {
+                channels[channel] = 0;
+                dma.SetMuxConfiguration(channel, 0);
+            }
+        }
+
+        // Host-side diagnostic control for matched disabled/working tests.
+        // It is not guest-visible and defaults to normal hardware propagation.
+        public bool RequestPropagationEnabled
+        {
+            get => requestPropagationEnabled;
+            set
+            {
+                requestPropagationEnabled = value;
+                for(var channel = 0; channel < ChannelCount; channel++)
+                {
+                    dma.SetMuxConfiguration(channel, value ? channels[channel] : (byte)0);
+                }
+            }
+        }
+
         public long Size => SizeValue;
+
+        private static bool IsValidRange(long offset, int size)
+        {
+            return (size == 1 || size == 2 || size == 4)
+                && offset >= 0 && offset <= SizeValue - size;
+        }
 
         private uint ReadSized(long offset, int size)
         {
@@ -1000,15 +1009,10 @@ namespace Antmicro.Renode.Peripherals.DMA
             }
         }
 
-        private static bool IsValidRange(long offset, int size)
-        {
-            return (size == 1 || size == 2 || size == 4)
-                && offset >= 0 && offset <= SizeValue - size;
-        }
+        private bool requestPropagationEnabled;
 
         private readonly MPC5645S_eDMA dma;
         private readonly byte[] channels;
-        private bool requestPropagationEnabled;
 
         private const int ChannelCount = 16;
         private const int SizeValue = 0x4000;

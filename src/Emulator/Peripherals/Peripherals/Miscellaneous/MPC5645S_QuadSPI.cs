@@ -1,5 +1,6 @@
 //
-// Copyright (c) 2026
+// Copyright (c) 2010-2026 Antmicro
+// Copyright (c) 2026 Alexey Zagorodnikov <xglooom@gmail.com>
 //
 // This file is licensed under the MIT License.
 // Full license text is available in 'licenses/MIT.txt'.
@@ -259,6 +260,91 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
 
         public long Size => SizeValue;
 
+        private static void ResetTimer(LimitTimer timer, ulong ticks)
+        {
+            timer.Reset();
+            timer.AutoUpdate = false;
+            timer.EventEnabled = true;
+            timer.Limit = ticks;
+            timer.Value = ticks;
+            timer.Enabled = false;
+        }
+
+        private static int DecodePort(uint address)
+        {
+            if(address >= FlashABase && address <= FlashAEnd)
+            {
+                return 0;
+            }
+            if(address >= FlashBBase && address <= FlashBEnd)
+            {
+                return 1;
+            }
+            if(address >= ParallelFlashBase && address <= ParallelFlashEnd)
+            {
+                return ParallelPort;
+            }
+            return InvalidPort;
+        }
+
+        private static bool IsSupportedCommandShape(byte command, int count)
+        {
+            switch(command)
+            {
+            case ModeBitResetCommand:
+            case WriteEnableCommand:
+            case WriteDisableCommand:
+                return count == 0;
+            case BankRegisterWriteCommand:
+            case ReadConfigurationRegisterCommand:
+            case ReadStatusRegisterCommand:
+                return count == 1;
+            case WriteRegistersCommand:
+                return count == 1 || count == 2;
+            default:
+                return false;
+            }
+        }
+
+        private static bool IsTransmitCommand(byte command)
+        {
+            return command == BankRegisterWriteCommand || command == WriteRegistersCommand;
+        }
+
+        private static bool IsReceiveCommand(byte command)
+        {
+            return command == ReadConfigurationRegisterCommand || command == ReadStatusRegisterCommand;
+        }
+
+        private static byte ExtractByte(uint value, long lane)
+        {
+            return (byte)(value >> ((3 - (int)lane) * 8));
+        }
+
+        private static uint PositionValue(long registerOffset, long offset, int size, uint value)
+        {
+            var lane = (int)(offset - registerOffset);
+            var shift = (4 - lane - size) * 8;
+            var mask = size == 4 ? uint.MaxValue : (1u << (size * 8)) - 1;
+            return (value & mask) << shift;
+        }
+
+        private static bool IsValidRange(long offset, int size)
+        {
+            return (size == 1 || size == 2 || size == 4)
+                && offset >= 0 && offset <= SizeValue - size;
+        }
+
+        private static bool WithinRegister(long offset, int size, long registerOffset)
+        {
+            return offset >= registerOffset && offset + size <= registerOffset + 4;
+        }
+
+        private static bool Overlaps(long offset, int size, long registerOffset)
+        {
+            return offset < registerOffset + 4 && registerOffset < offset + size;
+        }
+
         private uint ReadSized(long offset, int size)
         {
             if(!IsValidRange(offset, size))
@@ -472,32 +558,32 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 {
                     switch(currentCommand)
                     {
-                        case ModeBitResetCommand:
-                            flash.ContinuousReadMode = false;
-                            break;
-                        case BankRegisterWriteCommand:
-                            flash.BankRegister = currentTxData[0];
-                            break;
-                        case ReadConfigurationRegisterCommand:
-                            rx = (uint)flash.ConfigurationRegister1 << 24;
-                            hasReceiveData = true;
-                            break;
-                        case WriteEnableCommand:
-                            if(!flash.WriteInProgress)
-                            {
-                                flash.WriteEnableLatch = true;
-                            }
-                            break;
-                        case WriteRegistersCommand:
-                            StartFlashRegisterWrite(flash, currentPort, currentTxData);
-                            break;
-                        case ReadStatusRegisterCommand:
-                            rx = (uint)flash.BuildStatusRegister1() << 24;
-                            hasReceiveData = true;
-                            break;
-                        case WriteDisableCommand:
-                            flash.WriteEnableLatch = false;
-                            break;
+                    case ModeBitResetCommand:
+                        flash.ContinuousReadMode = false;
+                        break;
+                    case BankRegisterWriteCommand:
+                        flash.BankRegister = currentTxData[0];
+                        break;
+                    case ReadConfigurationRegisterCommand:
+                        rx = (uint)flash.ConfigurationRegister1 << 24;
+                        hasReceiveData = true;
+                        break;
+                    case WriteEnableCommand:
+                        if(!flash.WriteInProgress)
+                        {
+                            flash.WriteEnableLatch = true;
+                        }
+                        break;
+                    case WriteRegistersCommand:
+                        StartFlashRegisterWrite(flash, currentPort, currentTxData);
+                        break;
+                    case ReadStatusRegisterCommand:
+                        rx = (uint)flash.BuildStatusRegister1() << 24;
+                        hasReceiveData = true;
+                        break;
+                    case WriteDisableCommand:
+                        flash.WriteEnableLatch = false;
+                        break;
                     }
                 }
 
@@ -688,16 +774,6 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             timer.Enabled = true;
         }
 
-        private static void ResetTimer(LimitTimer timer, ulong ticks)
-        {
-            timer.Reset();
-            timer.AutoUpdate = false;
-            timer.EventEnabled = true;
-            timer.Limit = ticks;
-            timer.Value = ticks;
-            timer.Enabled = false;
-        }
-
         private S25FLSFlash GetFlashByPort(uint port)
         {
             if(port >= flashes.Length)
@@ -707,80 +783,98 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             return flashes[port];
         }
 
-        private static int DecodePort(uint address)
-        {
-            if(address >= FlashABase && address <= FlashAEnd)
-            {
-                return 0;
-            }
-            if(address >= FlashBBase && address <= FlashBEnd)
-            {
-                return 1;
-            }
-            if(address >= ParallelFlashBase && address <= ParallelFlashEnd)
-            {
-                return ParallelPort;
-            }
-            return InvalidPort;
-        }
+        private byte currentCommand;
+        private int currentDataCount;
+        private byte[] currentTxData;
+        private int pendingFlashWritePort;
+        private ulong completionCount;
+        private uint lastErrorFlags;
+        private uint lastAddress;
+        private uint lastTransmitData;
+        private uint lastReceiveData;
+        private int currentPort;
+        private uint lastCommand;
+        private uint flags;
+        private ulong rejectedCommandCount;
+        private uint receiveData;
+        private bool ipAccess;
 
-        private static bool IsSupportedCommandShape(byte command, int count)
-        {
-            switch(command)
-            {
-                case ModeBitResetCommand:
-                case WriteEnableCommand:
-                case WriteDisableCommand:
-                    return count == 0;
-                case BankRegisterWriteCommand:
-                case ReadConfigurationRegisterCommand:
-                case ReadStatusRegisterCommand:
-                    return count == 1;
-                case WriteRegistersCommand:
-                    return count == 1 || count == 2;
-                default:
-                    return false;
-            }
-        }
+        private bool busy;
+        private int receiveEntries;
+        private readonly IMachine machine;
+        private readonly LimitTimer transferTimer;
+        private readonly LimitTimer flashWriteTimer;
+        private readonly byte[] registers;
 
-        private static bool IsTransmitCommand(byte command)
-        {
-            return command == BankRegisterWriteCommand || command == WriteRegistersCommand;
-        }
+        private readonly object sync = new object();
+        private readonly Queue<byte> txBuffer;
+        private readonly S25FLSFlash[] flashes;
+        private readonly ulong transferTicks;
+        private readonly ulong registerWriteTicks;
+        private const byte WriteDisableCommand = 0x04;
+        private const int TxBufferFillLevelShift = 8;
+        private const int RxBufferFillLevelShift = 8;
+        private const int TxBufferCapacityBytes = 15 * 4;
 
-        private static bool IsReceiveCommand(byte command)
-        {
-            return command == ReadConfigurationRegisterCommand || command == ReadStatusRegisterCommand;
-        }
+        private const byte ModeBitResetCommand = 0xFF;
+        private const byte BankRegisterWriteCommand = 0x17;
+        private const byte ReadConfigurationRegisterCommand = 0x35;
+        private const byte WriteEnableCommand = 0x06;
+        private const byte WriteRegistersCommand = 0x01;
+        private const byte ReadStatusRegisterCommand = 0x05;
 
-        private static byte ExtractByte(uint value, long lane)
-        {
-            return (byte)(value >> ((3 - (int)lane) * 8));
-        }
+        private const uint RxBufferWatermarkMask = 0x1F;
 
-        private static uint PositionValue(long registerOffset, long offset, int size, uint value)
-        {
-            var lane = (int)(offset - registerOffset);
-            var shift = (4 - lane - size) * 8;
-            var mask = size == 4 ? uint.MaxValue : (1u << (size * 8)) - 1;
-            return (value & mask) << shift;
-        }
+        private const byte StatusWriteInProgressMask = 1 << 0;
+        private const uint FlashBBase = 0x78000000;
+        private const byte StatusRegisterWritableMask = 0xFC;
+        private const byte ConfigurationRegisterWritableMask = 0xFF;
 
-        private static bool IsValidRange(long offset, int size)
-        {
-            return (size == 1 || size == 2 || size == 4)
-                && offset >= 0 && offset <= SizeValue - size;
-        }
+        private const uint FlashABase = 0x70000000;
+        private const uint FlashAEnd = 0x77FFFFFF;
+        private const uint FlashBEnd = 0x7FFFFFFF;
+        private const uint ParallelFlashBase = 0x80000000;
+        private const uint ParallelFlashEnd = 0x8FFFFFFF;
+        private const int InvalidPort = -1;
+        private const int ParallelPort = -2;
 
-        private static bool WithinRegister(long offset, int size, long registerOffset)
-        {
-            return offset >= registerOffset && offset + size <= registerOffset + 4;
-        }
+        private const ulong DefaultTransferFrequency = 1000000;
+        private const uint TransactionFinishedFlag = 1u;
+        private const byte StatusWriteEnableLatchMask = 1 << 1;
+        private const uint IpCommandTriggerErrorFlag = 1u << 6;
+        private const long FlagsOffset = 0x160;
+        private const uint IpCommandUsageErrorFlag = 1u << 11;
 
-        private static bool Overlaps(long offset, int size, long registerOffset)
-        {
-            return offset < registerOffset + 4 && registerOffset < offset + size;
-        }
+        private const int SizeValue = 0x4000;
+        private const long ModuleConfigurationOffset = 0x000;
+        private const long SerialFlashAddressOffset = 0x100;
+        private const long InstructionCodeOffset = 0x104;
+        private const long RxBufferStatusOffset = 0x10C;
+        private const long RxBufferControlOffset = 0x110;
+        private const long TxBufferStatusOffset = 0x150;
+        private const long TxBufferDataOffset = 0x154;
+        private const long StatusOffset = 0x15C;
+        private const ulong DefaultTransferTicks = 10;
+        private const long ReceiveDataOffset = 0x200;
+
+        private const uint ModuleConfigurationResetValue = 0x000F4000;
+        private const uint ModuleDisableMask = 1u << 14;
+        private const uint ClearTxBufferMask = 1u << 11;
+        private const uint ClearRxBufferMask = 1u << 10;
+        private const uint VendorModelMask = 0x78;
+        private const int VendorModelShift = 3;
+        private const uint SpansionVendorModel = 2;
+
+        private const uint TxBufferNotEmptyMask = 1u << 24;
+        private const uint RxBufferWatermarkExceededMask = 1u << 16;
+        private const uint IpAccessMask = 1u << 1;
+        private const uint BusyMask = 1u;
+
+        private const uint TxBufferFillFlag = 1u << 27;
+        private const uint TxBufferUnderrunFlag = 1u << 26;
+        private const uint RxBufferDrainFlag = 1u << 16;
+        private const uint InstructionCodeErrorFlag = 1u << 10;
+        private const ulong DefaultRegisterWriteTicks = 100;
 
         private sealed class S25FLSFlash
         {
@@ -820,97 +914,5 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             public byte PendingStatusRegister1;
             public byte PendingConfigurationRegister1;
         }
-
-        private readonly object sync = new object();
-        private readonly IMachine machine;
-        private readonly LimitTimer transferTimer;
-        private readonly LimitTimer flashWriteTimer;
-        private readonly byte[] registers;
-        private readonly Queue<byte> txBuffer;
-        private readonly S25FLSFlash[] flashes;
-        private readonly ulong transferTicks;
-        private readonly ulong registerWriteTicks;
-
-        private bool busy;
-        private bool ipAccess;
-        private uint receiveData;
-        private int receiveEntries;
-        private uint flags;
-        private int currentPort;
-        private byte currentCommand;
-        private int currentDataCount;
-        private byte[] currentTxData;
-        private int pendingFlashWritePort;
-        private ulong completionCount;
-        private ulong rejectedCommandCount;
-        private uint lastCommand;
-        private uint lastAddress;
-        private uint lastTransmitData;
-        private uint lastReceiveData;
-        private uint lastErrorFlags;
-
-        private const int SizeValue = 0x4000;
-        private const long ModuleConfigurationOffset = 0x000;
-        private const long SerialFlashAddressOffset = 0x100;
-        private const long InstructionCodeOffset = 0x104;
-        private const long RxBufferStatusOffset = 0x10C;
-        private const long RxBufferControlOffset = 0x110;
-        private const long TxBufferStatusOffset = 0x150;
-        private const long TxBufferDataOffset = 0x154;
-        private const long StatusOffset = 0x15C;
-        private const long FlagsOffset = 0x160;
-        private const long ReceiveDataOffset = 0x200;
-
-        private const uint ModuleConfigurationResetValue = 0x000F4000;
-        private const uint ModuleDisableMask = 1u << 14;
-        private const uint ClearTxBufferMask = 1u << 11;
-        private const uint ClearRxBufferMask = 1u << 10;
-        private const uint VendorModelMask = 0x78;
-        private const int VendorModelShift = 3;
-        private const uint SpansionVendorModel = 2;
-
-        private const uint TxBufferNotEmptyMask = 1u << 24;
-        private const uint RxBufferWatermarkExceededMask = 1u << 16;
-        private const uint IpAccessMask = 1u << 1;
-        private const uint BusyMask = 1u;
-
-        private const uint TxBufferFillFlag = 1u << 27;
-        private const uint TxBufferUnderrunFlag = 1u << 26;
-        private const uint RxBufferDrainFlag = 1u << 16;
-        private const uint IpCommandUsageErrorFlag = 1u << 11;
-        private const uint InstructionCodeErrorFlag = 1u << 10;
-        private const uint IpCommandTriggerErrorFlag = 1u << 6;
-        private const uint TransactionFinishedFlag = 1u;
-
-        private const uint RxBufferWatermarkMask = 0x1F;
-        private const int TxBufferFillLevelShift = 8;
-        private const int RxBufferFillLevelShift = 8;
-        private const int TxBufferCapacityBytes = 15 * 4;
-
-        private const byte ModeBitResetCommand = 0xFF;
-        private const byte BankRegisterWriteCommand = 0x17;
-        private const byte ReadConfigurationRegisterCommand = 0x35;
-        private const byte WriteEnableCommand = 0x06;
-        private const byte WriteRegistersCommand = 0x01;
-        private const byte ReadStatusRegisterCommand = 0x05;
-        private const byte WriteDisableCommand = 0x04;
-
-        private const byte StatusWriteInProgressMask = 1 << 0;
-        private const byte StatusWriteEnableLatchMask = 1 << 1;
-        private const byte StatusRegisterWritableMask = 0xFC;
-        private const byte ConfigurationRegisterWritableMask = 0xFF;
-
-        private const uint FlashABase = 0x70000000;
-        private const uint FlashAEnd = 0x77FFFFFF;
-        private const uint FlashBBase = 0x78000000;
-        private const uint FlashBEnd = 0x7FFFFFFF;
-        private const uint ParallelFlashBase = 0x80000000;
-        private const uint ParallelFlashEnd = 0x8FFFFFFF;
-        private const int InvalidPort = -1;
-        private const int ParallelPort = -2;
-
-        private const ulong DefaultTransferFrequency = 1000000;
-        private const ulong DefaultTransferTicks = 10;
-        private const ulong DefaultRegisterWriteTicks = 100;
     }
 }

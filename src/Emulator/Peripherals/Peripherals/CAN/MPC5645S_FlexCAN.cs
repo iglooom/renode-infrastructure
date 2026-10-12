@@ -1,5 +1,6 @@
 //
-// Copyright (c) 2026
+// Copyright (c) 2010-2026 Antmicro
+// Copyright (c) 2026 Alexey Zagorodnikov <xglooom@gmail.com>
 //
 // This file is licensed under the MIT License.
 // Full license text is available in 'licenses/MIT.txt'.
@@ -10,13 +11,11 @@ using System.Collections.Generic;
 using System.Collections.ObjectModel;
 using System.Globalization;
 using System.IO;
-using System.Linq;
 using System.Text.RegularExpressions;
 
 using Antmicro.Renode.Core;
 using Antmicro.Renode.Core.CAN;
 using Antmicro.Renode.Exceptions;
-using Antmicro.Renode.Logging;
 using Antmicro.Renode.Peripherals.Bus;
 using Antmicro.Renode.Peripherals.Timers;
 using Antmicro.Renode.Time;
@@ -311,17 +310,39 @@ namespace Antmicro.Renode.Peripherals.CAN
             return receivedIds[index];
         }
 
-        public event Action<CANMessageFrame> FrameSent;
-
         public IReadOnlyDictionary<int, IGPIO> Connections { get; }
 
-        public long Size => PeripheralSize;
+        public bool ReplayRepeat => replayRepeat;
 
-        public ulong Frequency
-        {
-            get => freeRunningTimer.Frequency;
-            set => freeRunningTimer.Frequency = value;
-        }
+        public ulong ReplayDurationMicroseconds => replayDurationMicroseconds;
+
+        public string ReplayTimeOrigin => replayFrames.Count == 0 ? string.Empty : replayFirstTimestamp.ToString(CultureInfo.InvariantCulture);
+
+        public string ReplayPath => replayPath ?? string.Empty;
+
+        public string ReplaySourceChannels => string.Join(",", replaySourceChannels);
+
+        public string ReplayPrimarySourceChannel => replaySourceChannels.Count == 0 ? string.Empty : replaySourceChannels[0];
+
+        public int ReplaySourceChannelCount => replaySourceChannels.Count;
+
+        public bool ReplayInProgress => replayActive;
+
+        public ulong ReplayCompletedLoops => replayCompletedLoops;
+
+        public ulong ReplayAttemptedFrameCount => replayAttemptedFrameCount;
+
+        public uint LastTransmittedId => lastTransmittedId;
+
+        public uint LastReceivedId => lastReceivedId;
+
+        public int LastReceivedMailbox => lastReceivedMailbox;
+
+        public ulong TransmittedFrameCount => transmittedFrameCount;
+
+        public ulong DroppedFrameCount => droppedFrameCount;
+
+        public ulong ReceivedFrameCount => receivedFrameCount;
 
         public ulong BaudRate
         {
@@ -336,23 +357,58 @@ namespace Antmicro.Renode.Peripherals.CAN
             }
         }
 
-        public ulong ReceivedFrameCount => receivedFrameCount;
-        public ulong DroppedFrameCount => droppedFrameCount;
-        public ulong TransmittedFrameCount => transmittedFrameCount;
-        public int LastReceivedMailbox => lastReceivedMailbox;
-        public uint LastReceivedId => lastReceivedId;
-        public uint LastTransmittedId => lastTransmittedId;
+        public ulong Frequency
+        {
+            get => freeRunningTimer.Frequency;
+            set => freeRunningTimer.Frequency = value;
+        }
+
+        public long Size => PeripheralSize;
+
         public ulong ReplayLoadedFrameCount => (ulong)replayFrames.Count;
-        public ulong ReplayAttemptedFrameCount => replayAttemptedFrameCount;
-        public ulong ReplayCompletedLoops => replayCompletedLoops;
-        public bool ReplayInProgress => replayActive;
-        public int ReplaySourceChannelCount => replaySourceChannels.Count;
-        public string ReplayPrimarySourceChannel => replaySourceChannels.Count == 0 ? string.Empty : replaySourceChannels[0];
-        public string ReplaySourceChannels => string.Join(",", replaySourceChannels);
-        public string ReplayPath => replayPath ?? string.Empty;
-        public string ReplayTimeOrigin => replayFrames.Count == 0 ? string.Empty : replayFirstTimestamp.ToString(CultureInfo.InvariantCulture);
-        public ulong ReplayDurationMicroseconds => replayDurationMicroseconds;
-        public bool ReplayRepeat => replayRepeat;
+
+        public event Action<CANMessageFrame> FrameSent;
+
+        private static ulong FindFirstPositiveDelta(List<ReplayFrame> frames)
+        {
+            for(var i = 1; i < frames.Count; i++)
+            {
+                var delta = frames[i].OffsetMicroseconds - frames[i - 1].OffsetMicroseconds;
+                if(delta > 0)
+                {
+                    return delta;
+                }
+            }
+            return 1;
+        }
+
+        private static ulong DecimalSecondsToMicroseconds(decimal seconds)
+        {
+            if(seconds < 0)
+            {
+                throw new RecoverableException("Negative replay timestamp offset");
+            }
+            return decimal.ToUInt64(decimal.Round(seconds * 1000000m, 0, MidpointRounding.AwayFromZero));
+        }
+
+        private static uint PackDataWord(byte[] data, int start)
+        {
+            uint value = 0;
+            for(var i = 0; i < 4; i++)
+            {
+                value <<= 8;
+                if(start + i < data.Length)
+                {
+                    value |= data[start + i];
+                }
+            }
+            return value;
+        }
+
+        private static uint Merge(uint previous, uint value, uint mask)
+        {
+            return (previous & ~mask) | (value & mask);
+        }
 
         private void ResetController()
         {
@@ -412,32 +468,32 @@ namespace Antmicro.Renode.Peripherals.CAN
         {
             switch(offset)
             {
-                case ModuleConfigurationOffset:
-                    return mcr;
-                case Control1Offset:
-                    return control1;
-                case TimerOffset:
-                    SynchronizeCurrentCpuTime();
-                    ReleaseMailboxLocks();
-                    return (uint)freeRunningTimer.Value & 0xFFFFu;
-                case RxGlobalMaskOffset:
-                    return rxGlobalMask;
-                case Rx14MaskOffset:
-                    return rx14Mask;
-                case Rx15MaskOffset:
-                    return rx15Mask;
-                case ErrorAndStatusOffset:
-                    return errorAndStatus | (Ready ? (IdleMask | SynchronizationMask) : 0u);
-                case InterruptMask2Offset:
-                    return interruptMask2;
-                case InterruptMask1Offset:
-                    return interruptMask1;
-                case InterruptFlag2Offset:
-                    return interruptFlag2;
-                case InterruptFlag1Offset:
-                    return interruptFlag1;
-                default:
-                    return 0;
+            case ModuleConfigurationOffset:
+                return mcr;
+            case Control1Offset:
+                return control1;
+            case TimerOffset:
+                SynchronizeCurrentCpuTime();
+                ReleaseMailboxLocks();
+                return (uint)freeRunningTimer.Value & 0xFFFFu;
+            case RxGlobalMaskOffset:
+                return rxGlobalMask;
+            case Rx14MaskOffset:
+                return rx14Mask;
+            case Rx15MaskOffset:
+                return rx15Mask;
+            case ErrorAndStatusOffset:
+                return errorAndStatus | (Ready ? (IdleMask | SynchronizationMask) : 0u);
+            case InterruptMask2Offset:
+                return interruptMask2;
+            case InterruptMask1Offset:
+                return interruptMask1;
+            case InterruptFlag2Offset:
+                return interruptFlag2;
+            case InterruptFlag1Offset:
+                return interruptFlag1;
+            default:
+                return 0;
             }
         }
 
@@ -495,43 +551,43 @@ namespace Antmicro.Renode.Peripherals.CAN
 
             switch(offset)
             {
-                case ModuleConfigurationOffset:
-                    WriteModuleConfiguration(value, mask);
-                    break;
-                case Control1Offset:
-                    control1 = Merge(control1, value, mask);
-                    break;
-                case TimerOffset:
-                    // TIMER is read-only; reading it releases receive mailbox locks.
-                    break;
-                case RxGlobalMaskOffset:
-                    rxGlobalMask = Merge(rxGlobalMask, value, mask);
-                    break;
-                case Rx14MaskOffset:
-                    rx14Mask = Merge(rx14Mask, value, mask);
-                    break;
-                case Rx15MaskOffset:
-                    rx15Mask = Merge(rx15Mask, value, mask);
-                    break;
-                case ErrorAndStatusOffset:
-                    errorAndStatus &= ~(value & mask & ErrorStatusWritableOneToClearMask);
-                    break;
-                case InterruptMask2Offset:
-                    interruptMask2 = Merge(interruptMask2, value, mask);
-                    UpdateInterrupts();
-                    break;
-                case InterruptMask1Offset:
-                    interruptMask1 = Merge(interruptMask1, value, mask);
-                    UpdateInterrupts();
-                    break;
-                case InterruptFlag2Offset:
-                    interruptFlag2 &= ~(value & mask);
-                    UpdateInterrupts();
-                    break;
-                case InterruptFlag1Offset:
-                    interruptFlag1 &= ~(value & mask);
-                    UpdateInterrupts();
-                    break;
+            case ModuleConfigurationOffset:
+                WriteModuleConfiguration(value, mask);
+                break;
+            case Control1Offset:
+                control1 = Merge(control1, value, mask);
+                break;
+            case TimerOffset:
+                // TIMER is read-only; reading it releases receive mailbox locks.
+                break;
+            case RxGlobalMaskOffset:
+                rxGlobalMask = Merge(rxGlobalMask, value, mask);
+                break;
+            case Rx14MaskOffset:
+                rx14Mask = Merge(rx14Mask, value, mask);
+                break;
+            case Rx15MaskOffset:
+                rx15Mask = Merge(rx15Mask, value, mask);
+                break;
+            case ErrorAndStatusOffset:
+                errorAndStatus &= ~(value & mask & ErrorStatusWritableOneToClearMask);
+                break;
+            case InterruptMask2Offset:
+                interruptMask2 = Merge(interruptMask2, value, mask);
+                UpdateInterrupts();
+                break;
+            case InterruptMask1Offset:
+                interruptMask1 = Merge(interruptMask1, value, mask);
+                UpdateInterrupts();
+                break;
+            case InterruptFlag2Offset:
+                interruptFlag2 &= ~(value & mask);
+                UpdateInterrupts();
+                break;
+            case InterruptFlag1Offset:
+                interruptFlag1 &= ~(value & mask);
+                UpdateInterrupts();
+                break;
             }
         }
 
@@ -791,20 +847,6 @@ namespace Antmicro.Renode.Peripherals.CAN
             return result;
         }
 
-        private static uint PackDataWord(byte[] data, int start)
-        {
-            uint value = 0;
-            for(var i = 0; i < 4; i++)
-            {
-                value <<= 8;
-                if(start + i < data.Length)
-                {
-                    value |= data[start + i];
-                }
-            }
-            return value;
-        }
-
         private uint GetMailboxWord(int mailbox, int word)
         {
             return messageBufferWords[mailbox * MailboxWordCount + word];
@@ -854,69 +896,9 @@ namespace Antmicro.Renode.Peripherals.CAN
             }
         }
 
-        private static uint Merge(uint previous, uint value, uint mask)
-        {
-            return (previous & ~mask) | (value & mask);
-        }
-
-        private static ulong DecimalSecondsToMicroseconds(decimal seconds)
-        {
-            if(seconds < 0)
-            {
-                throw new RecoverableException("Negative replay timestamp offset");
-            }
-            return decimal.ToUInt64(decimal.Round(seconds * 1000000m, 0, MidpointRounding.AwayFromZero));
-        }
-
-        private static ulong FindFirstPositiveDelta(List<ReplayFrame> frames)
-        {
-            for(var i = 1; i < frames.Count; i++)
-            {
-                var delta = frames[i].OffsetMicroseconds - frames[i - 1].OffsetMicroseconds;
-                if(delta > 0)
-                {
-                    return delta;
-                }
-            }
-            return 1;
-        }
-
         private bool Ready => (mcr & ModuleDisableMask) == 0
             && !((mcr & FreezeEnableMask) != 0 && (mcr & HaltMask) != 0);
 
-        private sealed class ReplayFrame
-        {
-            public ReplayFrame(ulong offsetMicroseconds, CANMessageFrame message)
-            {
-                OffsetMicroseconds = offsetMicroseconds;
-                Message = message;
-            }
-
-            public ulong OffsetMicroseconds { get; }
-            public CANMessageFrame Message { get; }
-        }
-
-        private readonly object sync = new object();
-        private readonly IMachine machine;
-        private readonly LimitTimer freeRunningTimer;
-        private readonly uint[] messageBufferWords;
-        private readonly uint[] individualMasks;
-        private readonly bool[] mailboxLocked;
-        private readonly bool[] transmitPending;
-        private readonly ulong[] mailboxReceiveCounts;
-        private readonly GPIO[] interruptOutputs;
-        private readonly List<uint> receivedIds;
-        private List<ReplayFrame> replayFrames;
-        private List<string> replaySourceChannels;
-
-        private uint mcr;
-        private uint control1;
-        private uint rxGlobalMask;
-        private uint rx14Mask;
-        private uint rx15Mask;
-        private uint errorAndStatus;
-        private uint interruptMask1;
-        private uint interruptMask2;
         private uint interruptFlag1;
         private uint interruptFlag2;
         private ulong baudRate;
@@ -928,15 +910,68 @@ namespace Antmicro.Renode.Peripherals.CAN
         private uint lastTransmittedId;
 
         private bool replayActive;
-        private bool replayRepeat;
         private int replayIndex;
         private ulong replayGeneration;
-        private ulong replayAttemptedFrameCount;
         private ulong replayCompletedLoops;
         private ulong replayDurationMicroseconds;
         private ulong replayLoopGapMicroseconds;
         private decimal replayFirstTimestamp;
         private string replayPath;
+        private bool replayRepeat;
+        private uint interruptMask2;
+        private ulong replayAttemptedFrameCount;
+        private uint errorAndStatus;
+        private uint rx15Mask;
+        private uint rx14Mask;
+        private uint rxGlobalMask;
+        private uint control1;
+
+        private uint mcr;
+        private List<string> replaySourceChannels;
+        private List<ReplayFrame> replayFrames;
+        private uint interruptMask1;
+
+        private readonly object sync = new object();
+        private readonly IMachine machine;
+        private readonly LimitTimer freeRunningTimer;
+        private readonly uint[] messageBufferWords;
+        private readonly uint[] individualMasks;
+        private readonly bool[] mailboxLocked;
+        private readonly bool[] transmitPending;
+        private readonly ulong[] mailboxReceiveCounts;
+        private readonly GPIO[] interruptOutputs;
+        private readonly List<uint> receivedIds;
+        private const uint DataLengthCodeMask = 0xF;
+        private const uint LowPowerAcknowledgeMask = 0x00100000;
+        private const uint IndividualMaskingMask = 0x00010000;
+        private const uint MaximumMailboxMask = 0x0000003F;
+        private const uint ModuleConfigurationReadOnlyMask = NotReadyMask | SoftResetMask
+            | FreezeAcknowledgeMask | LowPowerAcknowledgeMask;
+
+        private const int CodeShift = 24;
+        private const uint CodeMask = 0xF;
+        private const uint CodeFieldMask = CodeMask << CodeShift;
+        private const int DataLengthShift = 16;
+        private const uint FreezeAcknowledgeMask = 0x01000000;
+        private const uint DataLengthFieldMask = DataLengthCodeMask << DataLengthShift;
+        private const int StandardIdentifierShift = 18;
+        private const uint IdentifierExtendedMask = 0x00200000;
+        private const uint TimestampMask = 0x0000FFFF;
+        private const uint ReceiveEmptyCode = 0x4;
+        private const uint ReceiveFullCode = 0x2;
+        private const uint ReceiveOverrunCode = 0x6;
+        private const uint TransmitInactiveCode = 0x8;
+        private const uint TransmitDataCode = 0xC;
+        private const uint SoftResetMask = 0x02000000;
+        private const uint StandardIdentifierMask = 0x7FF;
+        private const uint ExtendedIdentifierMask = 0x1FFFFFFF;
+
+        private const uint IdleMask = 1u << 7;
+        private const uint RemoteTransmissionRequestMask = 0x00100000;
+        private const uint NotReadyMask = 0x08000000;
+        private const long InterruptMask2Offset = 0x24;
+        private const uint FreezeEnableMask = 0x40000000;
+        private const uint SynchronizationMask = 1u << 18;
 
         private const long PeripheralSize = 0x4000;
         private const int MailboxCount = 64;
@@ -949,13 +984,12 @@ namespace Antmicro.Renode.Peripherals.CAN
         private const ulong ClassicalFrameOverheadBits = 47;
 
         private const long ModuleConfigurationOffset = 0x00;
+        private const uint HaltMask = 0x10000000;
         private const long Control1Offset = 0x04;
-        private const long TimerOffset = 0x08;
         private const long RxGlobalMaskOffset = 0x10;
         private const long Rx14MaskOffset = 0x14;
         private const long Rx15MaskOffset = 0x18;
         private const long ErrorAndStatusOffset = 0x20;
-        private const long InterruptMask2Offset = 0x24;
         private const long InterruptMask1Offset = 0x28;
         private const long InterruptFlag2Offset = 0x2C;
         private const long InterruptFlag1Offset = 0x30;
@@ -964,38 +998,21 @@ namespace Antmicro.Renode.Peripherals.CAN
 
         private const uint ModuleConfigurationResetValue = 0xD890000F;
         private const uint ModuleDisableMask = 0x80000000;
-        private const uint FreezeEnableMask = 0x40000000;
-        private const uint HaltMask = 0x10000000;
-        private const uint NotReadyMask = 0x08000000;
-        private const uint SoftResetMask = 0x02000000;
-        private const uint FreezeAcknowledgeMask = 0x01000000;
-        private const uint LowPowerAcknowledgeMask = 0x00100000;
-        private const uint IndividualMaskingMask = 0x00010000;
-        private const uint MaximumMailboxMask = 0x0000003F;
-        private const uint ModuleConfigurationReadOnlyMask = NotReadyMask | SoftResetMask
-            | FreezeAcknowledgeMask | LowPowerAcknowledgeMask;
-
-        private const int CodeShift = 24;
-        private const uint CodeMask = 0xF;
-        private const uint CodeFieldMask = CodeMask << CodeShift;
-        private const int DataLengthShift = 16;
-        private const uint DataLengthCodeMask = 0xF;
-        private const uint DataLengthFieldMask = DataLengthCodeMask << DataLengthShift;
-        private const uint RemoteTransmissionRequestMask = 0x00100000;
-        private const uint IdentifierExtendedMask = 0x00200000;
-        private const uint TimestampMask = 0x0000FFFF;
-        private const uint ReceiveEmptyCode = 0x4;
-        private const uint ReceiveFullCode = 0x2;
-        private const uint ReceiveOverrunCode = 0x6;
-        private const uint TransmitInactiveCode = 0x8;
-        private const uint TransmitDataCode = 0xC;
-        private const int StandardIdentifierShift = 18;
-        private const uint StandardIdentifierMask = 0x7FF;
-        private const uint ExtendedIdentifierMask = 0x1FFFFFFF;
-
-        private const uint IdleMask = 1u << 7;
-        private const uint SynchronizationMask = 1u << 18;
+        private const long TimerOffset = 0x08;
         private const uint ErrorStatusWritableOneToClearMask = 0xFFFFFFFF;
+
+        private sealed class ReplayFrame
+        {
+            public ReplayFrame(ulong offsetMicroseconds, CANMessageFrame message)
+            {
+                OffsetMicroseconds = offsetMicroseconds;
+                Message = message;
+            }
+
+            public ulong OffsetMicroseconds { get; }
+
+            public CANMessageFrame Message { get; }
+        }
 
         private static readonly ulong[] InterruptRouteMasks =
         {

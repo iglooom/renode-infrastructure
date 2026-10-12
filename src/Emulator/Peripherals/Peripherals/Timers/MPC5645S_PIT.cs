@@ -1,5 +1,6 @@
 //
-// Copyright (c) 2026
+// Copyright (c) 2010-2026 Antmicro
+// Copyright (c) 2026 Alexey Zagorodnikov <xglooom@gmail.com>
 //
 // This file is licensed under the MIT License.
 // Full license text is available in 'licenses/MIT.txt'.
@@ -143,9 +144,22 @@ namespace Antmicro.Renode.Peripherals.Timers
         public long Size => 0x4000;
 
         public GPIO IRQ0 => irqs[0];
+
         public GPIO IRQ1 => irqs[1];
+
         public GPIO IRQ2 => irqs[2];
+
         public GPIO IRQ3 => irqs[3];
+
+        private static ulong Period(Channel channel)
+        {
+            return (ulong)channel.LoadValue + 1UL;
+        }
+
+        private static uint Merge(uint previous, uint value, uint mask)
+        {
+            return (previous & ~mask) | (value & mask);
+        }
 
         private uint ReadRegister(long offset)
         {
@@ -164,33 +178,33 @@ namespace Antmicro.Renode.Peripherals.Timers
                 var channel = channels[channelIndex];
                 switch(registerOffset)
                 {
-                    case LoadValueOffset:
-                        return channel.LoadValue;
-                    case CurrentValueOffset:
+                case LoadValueOffset:
+                    return channel.LoadValue;
+                case CurrentValueOffset:
+                {
+                    if(!channel.HasLoadedValue)
                     {
-                        if(!channel.HasLoadedValue)
-                        {
-                            return 0;
-                        }
-                        SynchronizeCurrentCpuTime();
-                        var now = Now();
-                        CatchUp(channelIndex, now);
-                        var remaining = channel.Running ? channel.NextExpiry - now : channel.FrozenRemaining;
-                        return remaining == 0 ? 0 : (uint)(remaining - 1);
-                    }
-                    case ControlOffset:
-                        return channel.Control;
-                    case FlagOffset:
-                    {
-                        if(channel.Running && !channel.InterruptFlag)
-                        {
-                            SynchronizeCurrentCpuTime();
-                            CatchUp(channelIndex, Now());
-                        }
-                        return channel.InterruptFlag ? 1u : 0u;
-                    }
-                    default:
                         return 0;
+                    }
+                    SynchronizeCurrentCpuTime();
+                    var now = Now();
+                    CatchUp(channelIndex, now);
+                    var remaining = channel.Running ? channel.NextExpiry - now : channel.FrozenRemaining;
+                    return remaining == 0 ? 0 : (uint)(remaining - 1);
+                }
+                case ControlOffset:
+                    return channel.Control;
+                case FlagOffset:
+                {
+                    if(channel.Running && !channel.InterruptFlag)
+                    {
+                        SynchronizeCurrentCpuTime();
+                        CatchUp(channelIndex, Now());
+                    }
+                    return channel.InterruptFlag ? 1u : 0u;
+                }
+                default:
+                    return 0;
                 }
             }
         }
@@ -268,39 +282,39 @@ namespace Antmicro.Renode.Peripherals.Timers
                 CatchUp(channelIndex, now);
                 switch(registerOffset)
                 {
-                    case LoadValueOffset:
-                        // Takes effect at the next expiry; no restart.
-                        channel.LoadValue = Merge(channel.LoadValue, value, mask);
-                        break;
-                    case CurrentValueOffset:
-                        // CVAL is read-only.
-                        break;
-                    case ControlOffset:
-                        var previousControl = channel.Control;
-                        var mergedControl = Merge(previousControl, value, mask);
-                        if((mergedControl & ChainModeMask) != 0)
-                        {
-                            this.Log(LogLevel.Warning, "PIT channel {0}: chain mode is not implemented; CHN is ignored", channelIndex);
-                        }
-                        channel.Control = mergedControl & ControlWritableMask;
-                        var wasEnabled = (previousControl & TimerEnableMask) != 0;
-                        var isEnabled = (channel.Control & TimerEnableMask) != 0;
-                        if(!wasEnabled && isEnabled)
-                        {
-                            // Enabling loads LDVAL.
-                            channel.FrozenRemaining = Period(channel);
-                            channel.HasLoadedValue = true;
-                        }
-                        UpdateRunState(channelIndex, now);
+                case LoadValueOffset:
+                    // Takes effect at the next expiry; no restart.
+                    channel.LoadValue = Merge(channel.LoadValue, value, mask);
+                    break;
+                case CurrentValueOffset:
+                    // CVAL is read-only.
+                    break;
+                case ControlOffset:
+                    var previousControl = channel.Control;
+                    var mergedControl = Merge(previousControl, value, mask);
+                    if((mergedControl & ChainModeMask) != 0)
+                    {
+                        this.Log(LogLevel.Warning, "PIT channel {0}: chain mode is not implemented; CHN is ignored", channelIndex);
+                    }
+                    channel.Control = mergedControl & ControlWritableMask;
+                    var wasEnabled = (previousControl & TimerEnableMask) != 0;
+                    var isEnabled = (channel.Control & TimerEnableMask) != 0;
+                    if(!wasEnabled && isEnabled)
+                    {
+                        // Enabling loads LDVAL.
+                        channel.FrozenRemaining = Period(channel);
+                        channel.HasLoadedValue = true;
+                    }
+                    UpdateRunState(channelIndex, now);
+                    UpdateInterrupt(channelIndex);
+                    break;
+                case FlagOffset:
+                    if((value & mask & InterruptFlagMask) != 0)
+                    {
+                        channel.InterruptFlag = false;
                         UpdateInterrupt(channelIndex);
-                        break;
-                    case FlagOffset:
-                        if((value & mask & InterruptFlagMask) != 0)
-                        {
-                            channel.InterruptFlag = false;
-                            UpdateInterrupt(channelIndex);
-                        }
-                        break;
+                    }
+                    break;
                 }
                 UpdateAlarm(channelIndex, now);
             }
@@ -320,16 +334,16 @@ namespace Antmicro.Renode.Peripherals.Timers
             var channel = channels[channelIndex];
             switch(registerOffset)
             {
-                case LoadValueOffset:
-                    return Merge(channel.LoadValue, value, mask) == channel.LoadValue;
-                case CurrentValueOffset:
-                    return true;
-                case ControlOffset:
-                    return (Merge(channel.Control, value, mask) & ControlWritableMask) == channel.Control;
-                case FlagOffset:
-                    return (value & mask & InterruptFlagMask) == 0;
-                default:
-                    return true;
+            case LoadValueOffset:
+                return Merge(channel.LoadValue, value, mask) == channel.LoadValue;
+            case CurrentValueOffset:
+                return true;
+            case ControlOffset:
+                return (Merge(channel.Control, value, mask) & ControlWritableMask) == channel.Control;
+            case FlagOffset:
+                return (value & mask & InterruptFlagMask) == 0;
+            default:
+                return true;
             }
         }
 
@@ -449,11 +463,6 @@ namespace Antmicro.Renode.Peripherals.Timers
             return (ulong)(elapsed * frequency / TimeInterval.TicksPerSecond);
         }
 
-        private static ulong Period(Channel channel)
-        {
-            return (ulong)channel.LoadValue + 1UL;
-        }
-
         private void SynchronizeCurrentCpuTime()
         {
             if(machine.GetSystemBus(this).TryGetCurrentCPU(out var cpu))
@@ -478,10 +487,35 @@ namespace Antmicro.Renode.Peripherals.Timers
 
         private bool ModuleDisabled => (moduleControl & ModuleDisableMask) != 0;
 
-        private static uint Merge(uint previous, uint value, uint mask)
-        {
-            return (previous & ~mask) | (value & mask);
-        }
+        private ulong frequency;
+        private uint moduleControl;
+
+        private readonly object sync = new object();
+        private readonly IMachine machine;
+        private readonly Channel[] channels;
+        private readonly GPIO[] irqs;
+        private const uint ChainModeMask = 1u << 2;
+        private const uint InterruptEnableMask = 1u << 1;
+        private const uint TimerEnableMask = 1u << 0;
+        private const uint ModuleDisableMask = 1u << 1;
+        private const uint ModuleControlWritableMask = 0x7;
+
+        private const uint ModuleControlResetValue = 0x6;
+        private const long FlagOffset = 0xC;
+        private const long ControlOffset = 0x8;
+        private const long ChannelBaseOffset = 0x100;
+        private const long LoadValueOffset = 0x0;
+        private const long ChannelStride = 0x10;
+        private const uint ControlWritableMask = TimerEnableMask | InterruptEnableMask;
+
+        private const long ModuleControlOffset = 0x0;
+        // LimitTimer rejects Value above its constructor limit; a period is at most 2^32 ticks.
+        private const ulong MaximumAlarmTicks = 1UL << 33;
+        private const ulong DefaultFrequency = 40000000;
+
+        private const int ChannelCount = 4;
+        private const long CurrentValueOffset = 0x4;
+        private const uint InterruptFlagMask = 1u << 0;
 
         private sealed class Channel
         {
@@ -499,34 +533,5 @@ namespace Antmicro.Renode.Peripherals.Timers
             public bool AlarmArmed;
             public ulong ArmedExpiry;
         }
-
-        private readonly object sync = new object();
-        private readonly IMachine machine;
-        private readonly Channel[] channels;
-        private readonly GPIO[] irqs;
-        private ulong frequency;
-        private uint moduleControl;
-
-        private const int ChannelCount = 4;
-        private const ulong DefaultFrequency = 40000000;
-        // LimitTimer rejects Value above its constructor limit; a period is at most 2^32 ticks.
-        private const ulong MaximumAlarmTicks = 1UL << 33;
-
-        private const long ModuleControlOffset = 0x0;
-        private const long ChannelBaseOffset = 0x100;
-        private const long ChannelStride = 0x10;
-        private const long LoadValueOffset = 0x0;
-        private const long CurrentValueOffset = 0x4;
-        private const long ControlOffset = 0x8;
-        private const long FlagOffset = 0xC;
-
-        private const uint ModuleControlResetValue = 0x6;
-        private const uint ModuleControlWritableMask = 0x7;
-        private const uint ModuleDisableMask = 1u << 1;
-        private const uint TimerEnableMask = 1u << 0;
-        private const uint InterruptEnableMask = 1u << 1;
-        private const uint ChainModeMask = 1u << 2;
-        private const uint ControlWritableMask = TimerEnableMask | InterruptEnableMask;
-        private const uint InterruptFlagMask = 1u << 0;
     }
 }

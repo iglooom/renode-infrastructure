@@ -1,5 +1,6 @@
 //
-// Copyright (c) 2026
+// Copyright (c) 2010-2026 Antmicro
+// Copyright (c) 2026 Alexey Zagorodnikov <xglooom@gmail.com>
 //
 // This file is licensed under the MIT License.
 // Full license text is available in 'licenses/MIT.txt'.
@@ -89,19 +90,24 @@ namespace Antmicro.Renode.Peripherals.Timers
 
         public long Size => 0x4000;
 
+        private static uint Merge(uint previous, uint value, uint mask)
+        {
+            return (previous & ~mask) | (value & mask);
+        }
+
         private uint ReadRegister(long offset)
         {
             lock(sync)
             {
                 switch(offset)
                 {
-                    case ControlOffset:
-                        return control;
-                    case CountOffset:
-                        SynchronizeCurrentCpuTime();
-                        return Count(NowTicks());
-                    default:
-                        return 0;
+                case ControlOffset:
+                    return control;
+                case CountOffset:
+                    SynchronizeCurrentCpuTime();
+                    return Count(NowTicks());
+                default:
+                    return 0;
                 }
             }
         }
@@ -141,20 +147,20 @@ namespace Antmicro.Renode.Peripherals.Timers
             {
                 switch(offset)
                 {
-                    case ControlOffset:
-                        SynchronizeCurrentCpuTime();
-                        // Count up to this instant with the old divider, then switch.
-                        Rebase();
-                        control = Merge(control, value, mask) & ControlWritableMask;
-                        divider = ((control & CounterPrescalerMask) >> CounterPrescalerShift) + 1u;
-                        running = (control & TimerEnableMask) != 0;
-                        break;
-                    case CountOffset:
-                        SynchronizeCurrentCpuTime();
-                        var now = NowTicks();
-                        baseCount = Merge(Count(now), value, mask);
-                        baseTicks = now;
-                        break;
+                case ControlOffset:
+                    SynchronizeCurrentCpuTime();
+                    // Count up to this instant with the old divider, then switch.
+                    Rebase();
+                    control = Merge(control, value, mask) & ControlWritableMask;
+                    divider = ((control & CounterPrescalerMask) >> CounterPrescalerShift) + 1u;
+                    running = (control & TimerEnableMask) != 0;
+                    break;
+                case CountOffset:
+                    SynchronizeCurrentCpuTime();
+                    var now = NowTicks();
+                    baseCount = Merge(Count(now), value, mask);
+                    baseTicks = now;
+                    break;
                 }
             }
         }
@@ -191,19 +197,15 @@ namespace Antmicro.Renode.Peripherals.Timers
             }
         }
 
-        private static uint Merge(uint previous, uint value, uint mask)
-        {
-            return (previous & ~mask) | (value & mask);
-        }
-
-        private readonly object sync = new object();
-        private readonly IMachine machine;
         private ulong frequency;
         private uint control;
         private uint divider;
         private bool running;
         private uint baseCount;
         private ulong baseTicks;
+
+        private readonly object sync = new object();
+        private readonly IMachine machine;
 
         private const ulong DefaultFrequency = 40000000;
         private const long ControlOffset = 0x0;

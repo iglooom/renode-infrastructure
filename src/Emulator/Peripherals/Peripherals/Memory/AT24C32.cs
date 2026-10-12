@@ -1,5 +1,6 @@
 //
-// Copyright (c) 2026
+// Copyright (c) 2010-2026 Antmicro
+// Copyright (c) 2026 Alexey Zagorodnikov <xglooom@gmail.com>
 //
 // This file is licensed under the MIT License.
 // Full license text is available in 'licenses/MIT.txt'.
@@ -286,13 +287,6 @@ namespace Antmicro.Renode.Peripherals.Memory
             LastReadAddress = 0;
         }
 
-        private readonly object sync = new object();
-        private readonly byte[] memory;
-        private readonly byte[] stagedPage;
-        private readonly byte[] programmingPage;
-        private readonly LimitTimer programTimer;
-        private readonly uint writeCycleMilliseconds;
-        private readonly bool writeProtected;
         private int addressBytes;
         private int currentAddress;
         private int stagedPageBase;
@@ -300,6 +294,14 @@ namespace Antmicro.Renode.Peripherals.Memory
         private int programmingPageBase;
         private uint programmingMask;
         private string inputPath;
+
+        private readonly object sync = new object();
+        private readonly byte[] memory;
+        private readonly byte[] stagedPage;
+        private readonly byte[] programmingPage;
+        private readonly LimitTimer programTimer;
+        private readonly uint writeCycleMilliseconds;
+        private readonly bool writeProtected;
 
         private const int MemorySize = 4096;
         private const int AddressMask = MemorySize - 1;

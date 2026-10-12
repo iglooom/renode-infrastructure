@@ -1,5 +1,6 @@
 //
-// Copyright (c) 2026
+// Copyright (c) 2010-2026 Antmicro
+// Copyright (c) 2026 Alexey Zagorodnikov <xglooom@gmail.com>
 //
 // This file is licensed under the MIT License.
 // Full license text is available in 'licenses/MIT.txt'.
@@ -10,7 +11,6 @@ using System.Collections.Generic;
 
 using Antmicro.Renode.Core;
 using Antmicro.Renode.Core.Structure;
-using Antmicro.Renode.Logging;
 using Antmicro.Renode.Peripherals.Bus;
 using Antmicro.Renode.Peripherals.Timers;
 using Antmicro.Renode.Time;
@@ -20,7 +20,9 @@ namespace Antmicro.Renode.Peripherals.I2C
     public interface IMPC56xxI2CPeripheral : II2CPeripheral
     {
         bool BeginTransmission(bool read);
+
         void EndTransmission(bool stop);
+
         void AbortTransmission();
     }
 
@@ -129,26 +131,26 @@ namespace Antmicro.Renode.Peripherals.I2C
                 }
                 switch((Registers)offset)
                 {
-                    case Registers.Status:
-                        if((value & StatusInterruptFlag) != 0)
-                        {
-                            registers[(int)Registers.Status] &= unchecked((byte)~StatusInterruptFlag);
-                        }
-                        if((value & StatusArbitrationLost) != 0)
-                        {
-                            registers[(int)Registers.Status] &= unchecked((byte)~StatusArbitrationLost);
-                        }
-                        UpdateInterrupt();
-                        return;
-                    case Registers.Control:
-                        WriteControl(value);
-                        return;
-                    case Registers.Data:
-                        WriteData(value);
-                        return;
-                    default:
-                        registers[offset] = value;
-                        return;
+                case Registers.Status:
+                    if((value & StatusInterruptFlag) != 0)
+                    {
+                        registers[(int)Registers.Status] &= unchecked((byte)~StatusInterruptFlag);
+                    }
+                    if((value & StatusArbitrationLost) != 0)
+                    {
+                        registers[(int)Registers.Status] &= unchecked((byte)~StatusArbitrationLost);
+                    }
+                    UpdateInterrupt();
+                    return;
+                case Registers.Control:
+                    WriteControl(value);
+                    return;
+                case Registers.Data:
+                    WriteData(value);
+                    return;
+                default:
+                    registers[offset] = value;
+                    return;
                 }
             }
         }
@@ -398,9 +400,17 @@ namespace Antmicro.Renode.Peripherals.I2C
         }
 
         private bool IsDisabled => (registers[(int)Registers.Control] & ControlModuleDisable) != 0;
+
         private bool IsMaster => (registers[(int)Registers.Control] & ControlMaster) != 0;
+
         private bool IsTransmitting => (registers[(int)Registers.Control] & ControlTransmit) != 0;
+
         private bool IsReceiving => state == TransferState.Receiving && !IsTransmitting;
+
+        private II2CPeripheral selectedDevice;
+        private IMPC56xxI2CPeripheral selectedExtendedDevice;
+        private TransferState state;
+        private PendingOperation pendingOperation;
 
         private readonly object sync = new object();
         private readonly LimitTimer transferTimer;
@@ -408,10 +418,6 @@ namespace Antmicro.Renode.Peripherals.I2C
         private readonly byte[] registers;
         private readonly ulong inputClockFrequency;
         private readonly ulong byteTransferTicks;
-        private II2CPeripheral selectedDevice;
-        private IMPC56xxI2CPeripheral selectedExtendedDevice;
-        private TransferState state;
-        private PendingOperation pendingOperation;
 
         private const ulong DefaultInputClockFrequency = 40000000;
         private const ulong DefaultByteTransferTicks = 400;

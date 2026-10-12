@@ -1,5 +1,6 @@
 //
-// Copyright (c) 2026
+// Copyright (c) 2010-2026 Antmicro
+// Copyright (c) 2026 Alexey Zagorodnikov <xglooom@gmail.com>
 //
 // This file is licensed under the MIT License.
 // Full license text is available in 'licenses/MIT.txt'.
@@ -33,6 +34,18 @@ namespace Antmicro.Renode.Peripherals.IRQControllers
             priorityStack = new List<byte>(MaximumNestingDepth);
             IRQ = new GPIO();
             Reset();
+        }
+
+        public ulong GetAcknowledgeCount(int source)
+        {
+            lock(sync)
+            {
+                if(source < 0 || source >= numberOfSources)
+                {
+                    return 0;
+                }
+                return sourceAcknowledgeCounts[source];
+            }
         }
 
         public void OnGPIO(int number, bool value)
@@ -120,16 +133,9 @@ namespace Antmicro.Renode.Peripherals.IRQControllers
 
         public bool HardwareVectorModeSupported => false;
 
-        public ulong GetAcknowledgeCount(int source)
+        private static uint Merge(uint previous, uint value, uint mask)
         {
-            lock(sync)
-            {
-                if(source < 0 || source >= numberOfSources)
-                {
-                    return 0;
-                }
-                return sourceAcknowledgeCounts[source];
-            }
+            return (previous & ~mask) | (value & mask);
         }
 
         private uint ReadSized(long offset, int size)
@@ -389,10 +395,10 @@ namespace Antmicro.Renode.Peripherals.IRQControllers
 
         private uint VectorTableBaseMask => vectorTableEntrySize8 ? 0xFFFFF000u : 0xFFFFF800u;
 
-        private static uint Merge(uint previous, uint value, uint mask)
-        {
-            return (previous & ~mask) | (value & mask);
-        }
+        private uint vectorTableBase;
+        private byte currentPriority;
+        private bool vectorTableEntrySize8;
+        private int? latchedSource;
 
         private readonly object sync = new object();
         private readonly int numberOfSources;
@@ -401,11 +407,6 @@ namespace Antmicro.Renode.Peripherals.IRQControllers
         private readonly byte[] priorities;
         private readonly ulong[] sourceAcknowledgeCounts;
         private readonly List<byte> priorityStack;
-
-        private uint vectorTableBase;
-        private byte currentPriority;
-        private bool vectorTableEntrySize8;
-        private int? latchedSource;
 
         private const int DefaultNumberOfSources = 239;
         private const int MaximumNumberOfSources = 512;

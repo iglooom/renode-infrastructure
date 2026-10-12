@@ -1,5 +1,6 @@
 //
-// Copyright (c) 2026
+// Copyright (c) 2010-2026 Antmicro
+// Copyright (c) 2026 Alexey Zagorodnikov <xglooom@gmail.com>
 //
 // This file is licensed under the MIT License.
 // Full license text is available in 'licenses/MIT.txt'.
@@ -192,8 +193,54 @@ namespace Antmicro.Renode.Peripherals.Analog
         public long Size => 0x4000;
 
         public GPIO EOC { get; }
+
         public GPIO Error { get; }
+
         public GPIO Watchdog { get; }
+
+        private static uint ChannelBit(int channel)
+        {
+            return 1u << (channel & 31);
+        }
+
+        private static int CountBits(uint value)
+        {
+            var count = 0;
+            while(value != 0)
+            {
+                value &= value - 1;
+                count++;
+            }
+            return count;
+        }
+
+        private static bool TryDecodeDataRegister(long offset, out int channel)
+        {
+            channel = -1;
+            if(offset >= DataRegister32Offset && offset <= DataRegister50Offset && (offset & 3) == 0)
+            {
+                channel = 32 + (int)((offset - DataRegister32Offset) / 4);
+                return true;
+            }
+            if(offset >= DataRegister64Offset && offset <= DataRegister71Offset && (offset & 3) == 0)
+            {
+                channel = 64 + (int)((offset - DataRegister64Offset) / 4);
+                return true;
+            }
+            return false;
+        }
+
+        private static uint BuildDataRegister(ChannelData data)
+        {
+            return (data.Valid ? ValidMask : 0u) |
+                   (data.Overwritten ? OverwriteMask : 0u) |
+                   (data.Value & DataMask);
+        }
+
+        private static uint Merge(uint previous, uint value, uint mask)
+        {
+            return (previous & ~mask) | (value & mask);
+        }
 
         private uint ReadSized(long offset, int size)
         {
@@ -229,39 +276,39 @@ namespace Antmicro.Renode.Peripherals.Analog
                 }
                 switch(offset)
                 {
-                    case MainConfigurationOffset:
-                        return mainConfiguration;
-                    case MainStatusOffset:
-                        return mainStatus;
-                    case InterruptStatusOffset:
-                        return interruptStatus;
-                    case ChannelPending1Offset:
-                        return channelPending1;
-                    case ChannelPending2Offset:
-                        return channelPending2;
-                    case InterruptMaskOffset:
-                        return interruptMask;
-                    case ChannelInterruptMask1Offset:
-                        return channelInterruptMask1;
-                    case ChannelInterruptMask2Offset:
-                        return channelInterruptMask2;
-                    case ConversionTiming1Offset:
-                        return conversionTiming1;
-                    case ConversionTiming2Offset:
-                        return conversionTiming2;
-                    case NormalConversionMask1Offset:
-                        return normalConversionMask1;
-                    case NormalConversionMask2Offset:
-                        return normalConversionMask2;
-                    default:
-                        if(TryDecodeDataRegister(offset, out var channel))
-                        {
-                            var result = BuildDataRegister(channelData[channel]);
-                            channelData[channel].Valid = false;
-                            channelData[channel].Overwritten = false;
-                            return result;
-                        }
-                        return 0;
+                case MainConfigurationOffset:
+                    return mainConfiguration;
+                case MainStatusOffset:
+                    return mainStatus;
+                case InterruptStatusOffset:
+                    return interruptStatus;
+                case ChannelPending1Offset:
+                    return channelPending1;
+                case ChannelPending2Offset:
+                    return channelPending2;
+                case InterruptMaskOffset:
+                    return interruptMask;
+                case ChannelInterruptMask1Offset:
+                    return channelInterruptMask1;
+                case ChannelInterruptMask2Offset:
+                    return channelInterruptMask2;
+                case ConversionTiming1Offset:
+                    return conversionTiming1;
+                case ConversionTiming2Offset:
+                    return conversionTiming2;
+                case NormalConversionMask1Offset:
+                    return normalConversionMask1;
+                case NormalConversionMask2Offset:
+                    return normalConversionMask2;
+                default:
+                    if(TryDecodeDataRegister(offset, out var channel))
+                    {
+                        var result = BuildDataRegister(channelData[channel]);
+                        channelData[channel].Valid = false;
+                        channelData[channel].Overwritten = false;
+                        return result;
+                    }
+                    return 0;
                 }
             }
         }
@@ -313,67 +360,67 @@ namespace Antmicro.Renode.Peripherals.Analog
             {
                 switch(offset)
                 {
-                    case MainConfigurationOffset:
-                        var previousConfiguration = mainConfiguration;
-                        mainConfiguration = Merge(mainConfiguration, value, mask) & MainConfigurationWritableMask;
-                        if((mainConfiguration & PowerDownMask) != 0)
+                case MainConfigurationOffset:
+                    var previousConfiguration = mainConfiguration;
+                    mainConfiguration = Merge(mainConfiguration, value, mask) & MainConfigurationWritableMask;
+                    if((mainConfiguration & PowerDownMask) != 0)
+                    {
+                        StopConversion(PowerDownStatus);
+                    }
+                    else
+                    {
+                        if((previousConfiguration & PowerDownMask) != 0)
                         {
-                            StopConversion(PowerDownStatus);
+                            mainStatus = IdleStatus;
                         }
-                        else
+                        if((mainConfiguration & NormalStartMask) != 0)
                         {
-                            if((previousConfiguration & PowerDownMask) != 0)
-                            {
-                                mainStatus = IdleStatus;
-                            }
-                            if((mainConfiguration & NormalStartMask) != 0)
-                            {
-                                StartNormalConversion();
-                            }
+                            StartNormalConversion();
                         }
-                        break;
-                    case InterruptStatusOffset:
-                        interruptStatus &= ~(value & mask & InterruptStatusMask);
-                        UpdateInterrupts();
-                        break;
-                    case ChannelPending1Offset:
-                        channelPending1 &= ~(value & mask & InternalChannelMask);
-                        UpdateInterrupts();
-                        break;
-                    case ChannelPending2Offset:
-                        channelPending2 &= ~(value & mask & ExternalChannelMask);
-                        UpdateInterrupts();
-                        break;
-                    case InterruptMaskOffset:
-                        interruptMask = Merge(interruptMask, value, mask) & InterruptStatusMask;
-                        UpdateInterrupts();
-                        break;
-                    case ChannelInterruptMask1Offset:
-                        channelInterruptMask1 = Merge(channelInterruptMask1, value, mask) & InternalChannelMask;
-                        UpdateInterrupts();
-                        break;
-                    case ChannelInterruptMask2Offset:
-                        channelInterruptMask2 = Merge(channelInterruptMask2, value, mask) & ExternalChannelMask;
-                        UpdateInterrupts();
-                        break;
-                    case ConversionTiming1Offset:
-                        conversionTiming1 = Merge(conversionTiming1, value, mask);
-                        break;
-                    case ConversionTiming2Offset:
-                        conversionTiming2 = Merge(conversionTiming2, value, mask);
-                        break;
-                    case NormalConversionMask1Offset:
-                        normalConversionMask1 = Merge(normalConversionMask1, value, mask) & InternalChannelMask;
-                        break;
-                    case NormalConversionMask2Offset:
-                        normalConversionMask2 = Merge(normalConversionMask2, value, mask) & ExternalChannelMask;
-                        break;
-                    default:
-                        if(TryDecodeDataRegister(offset, out _))
-                        {
-                            this.Log(LogLevel.Warning, "Writes to ADC channel data registers are not implemented and are ignored");
-                        }
-                        break;
+                    }
+                    break;
+                case InterruptStatusOffset:
+                    interruptStatus &= ~(value & mask & InterruptStatusMask);
+                    UpdateInterrupts();
+                    break;
+                case ChannelPending1Offset:
+                    channelPending1 &= ~(value & mask & InternalChannelMask);
+                    UpdateInterrupts();
+                    break;
+                case ChannelPending2Offset:
+                    channelPending2 &= ~(value & mask & ExternalChannelMask);
+                    UpdateInterrupts();
+                    break;
+                case InterruptMaskOffset:
+                    interruptMask = Merge(interruptMask, value, mask) & InterruptStatusMask;
+                    UpdateInterrupts();
+                    break;
+                case ChannelInterruptMask1Offset:
+                    channelInterruptMask1 = Merge(channelInterruptMask1, value, mask) & InternalChannelMask;
+                    UpdateInterrupts();
+                    break;
+                case ChannelInterruptMask2Offset:
+                    channelInterruptMask2 = Merge(channelInterruptMask2, value, mask) & ExternalChannelMask;
+                    UpdateInterrupts();
+                    break;
+                case ConversionTiming1Offset:
+                    conversionTiming1 = Merge(conversionTiming1, value, mask);
+                    break;
+                case ConversionTiming2Offset:
+                    conversionTiming2 = Merge(conversionTiming2, value, mask);
+                    break;
+                case NormalConversionMask1Offset:
+                    normalConversionMask1 = Merge(normalConversionMask1, value, mask) & InternalChannelMask;
+                    break;
+                case NormalConversionMask2Offset:
+                    normalConversionMask2 = Merge(normalConversionMask2, value, mask) & ExternalChannelMask;
+                    break;
+                default:
+                    if(TryDecodeDataRegister(offset, out _))
+                    {
+                        this.Log(LogLevel.Warning, "Writes to ADC channel data registers are not implemented and are ignored");
+                    }
+                    break;
                 }
             }
         }
@@ -598,22 +645,6 @@ namespace Antmicro.Renode.Peripherals.Analog
             return 0;
         }
 
-        private static uint ChannelBit(int channel)
-        {
-            return 1u << (channel & 31);
-        }
-
-        private static int CountBits(uint value)
-        {
-            var count = 0;
-            while(value != 0)
-            {
-                value &= value - 1;
-                count++;
-            }
-            return count;
-        }
-
         private void SynchronizeCurrentCpuTime()
         {
             if(machine.GetSystemBus(this).TryGetCurrentCPU(out var cpu))
@@ -622,77 +653,63 @@ namespace Antmicro.Renode.Peripherals.Analog
             }
         }
 
-        private static bool TryDecodeDataRegister(long offset, out int channel)
-        {
-            channel = -1;
-            if(offset >= DataRegister32Offset && offset <= DataRegister50Offset && (offset & 3) == 0)
-            {
-                channel = 32 + (int)((offset - DataRegister32Offset) / 4);
-                return true;
-            }
-            if(offset >= DataRegister64Offset && offset <= DataRegister71Offset && (offset & 3) == 0)
-            {
-                channel = 64 + (int)((offset - DataRegister64Offset) / 4);
-                return true;
-            }
-            return false;
-        }
-
-        private static uint BuildDataRegister(ChannelData data)
-        {
-            return (data.Valid ? ValidMask : 0u) |
-                   (data.Overwritten ? OverwriteMask : 0u) |
-                   (data.Value & DataMask);
-        }
-
-        private static uint Merge(uint previous, uint value, uint mask)
-        {
-            return (previous & ~mask) | (value & mask);
-        }
-
-        private struct ChannelData
-        {
-            public ushort Value;
-            public bool Valid;
-            public bool Overwritten;
-        }
+        private uint channelInterruptMask2;
+        private uint normalConversionMask1;
+        private uint normalConversionMask2;
+        private uint conversionTiming2;
+        private uint activeNormalMask1;
+        private bool scanActive;
+        private uint channelInterruptMask1;
+        private bool lazyScan;
+        private ulong nextChainTick;
+        private ulong scanChainTicks;
+        private uint activeNormalMask2;
+        private uint channelPending2;
+        private uint conversionTiming1;
+        private uint interruptMask;
+        private uint interruptStatus;
+        private uint mainStatus;
+        private uint mainConfiguration;
+        private uint channelPending1;
 
         private readonly object sync = new object();
         private readonly IMachine machine;
         private readonly LimitTimer conversionTimer;
         private readonly ushort[] channelInputs;
-        private readonly ulong[] pulseGeneration;
         private readonly ulong[] pulseCompletedGeneration;
         private readonly ushort[] pulseRestoreValue;
         private readonly ChannelData[] channelData;
-        private uint mainConfiguration;
-        private uint mainStatus;
-        private uint interruptStatus;
-        private uint interruptMask;
-        private uint channelPending1;
-        private uint channelPending2;
-        private uint channelInterruptMask1;
-        private uint channelInterruptMask2;
-        private uint normalConversionMask1;
-        private uint normalConversionMask2;
-        private uint conversionTiming1;
-        private uint conversionTiming2;
-        private uint activeNormalMask1;
-        private uint activeNormalMask2;
-        private bool scanActive;
-        private bool lazyScan;
-        private ulong nextChainTick;
-        private ulong scanChainTicks;
+        private readonly ulong[] pulseGeneration;
+        private const long ChannelPending2Offset = 0x01C;
+        private const uint MainConfigurationWritableMask = 0xE10001E1;
+
+        private const long MainConfigurationOffset = 0x000;
+        private const long MainStatusOffset = 0x004;
+        private const long InterruptStatusOffset = 0x010;
+        private const long ChannelPending1Offset = 0x018;
+        private const long InterruptMaskOffset = 0x020;
+        private const long DataRegister32Offset = 0x180;
+        private const long ChannelInterruptMask2Offset = 0x02C;
+        private const long ConversionTiming1Offset = 0x098;
+        private const long ConversionTiming2Offset = 0x09C;
+        private const long NormalConversionMask1Offset = 0x0A8;
+        private const long NormalConversionMask2Offset = 0x0AC;
+        private const long DataRegister50Offset = 0x1C8;
+        private const uint ExternalChannelMask = 0x000000FF;
+        private const long ChannelInterruptMask1Offset = 0x028;
+        private const uint InternalChannelMask = 0x0007FFFF;
+        private const int ChannelCount = 96;
+        private const int ChannelAddressShift = 9;
 
         private const ulong DefaultConversionFrequency = 1000000;
         private const ulong MaximumConversionTicks = 128;
-        private const int ChannelCount = 96;
+        private const long DataRegister64Offset = 0x200;
         private const int LogicalChannelCount = 19;
         private const uint DataMask = 0x3FF;
         private const uint ValidMask = 0x00080000;
         private const uint OverwriteMask = 0x00040000;
+        private const uint InterruptStatusMask = 0x0000000F;
         private const uint PowerDownMask = 0x00000001;
-        private const uint PowerDownStatus = 0x00000001;
         private const uint IdleStatus = 0x00000000;
         private const uint NormalStartMask = 0x01000000;
         private const uint NormalStartStatus = 0x01000000;
@@ -700,27 +717,14 @@ namespace Antmicro.Renode.Peripherals.Analog
         private const uint OverwriteEnableMask = 0x80000000;
         private const uint EndOfConversionMask = 0x00000002;
         private const uint EndOfChainMask = 0x00000001;
-        private const int ChannelAddressShift = 9;
-        private const uint InterruptStatusMask = 0x0000000F;
-        private const uint InternalChannelMask = 0x0007FFFF;
-        private const uint ExternalChannelMask = 0x000000FF;
-        private const uint MainConfigurationWritableMask = 0xE10001E1;
-
-        private const long MainConfigurationOffset = 0x000;
-        private const long MainStatusOffset = 0x004;
-        private const long InterruptStatusOffset = 0x010;
-        private const long ChannelPending1Offset = 0x018;
-        private const long ChannelPending2Offset = 0x01C;
-        private const long InterruptMaskOffset = 0x020;
-        private const long ChannelInterruptMask1Offset = 0x028;
-        private const long ChannelInterruptMask2Offset = 0x02C;
-        private const long ConversionTiming1Offset = 0x098;
-        private const long ConversionTiming2Offset = 0x09C;
-        private const long NormalConversionMask1Offset = 0x0A8;
-        private const long NormalConversionMask2Offset = 0x0AC;
-        private const long DataRegister32Offset = 0x180;
-        private const long DataRegister50Offset = 0x1C8;
-        private const long DataRegister64Offset = 0x200;
+        private const uint PowerDownStatus = 0x00000001;
         private const long DataRegister71Offset = 0x21C;
+
+        private struct ChannelData
+        {
+            public ushort Value;
+            public bool Valid;
+            public bool Overwritten;
+        }
     }
 }
