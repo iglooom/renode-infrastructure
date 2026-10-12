@@ -37,6 +37,7 @@ namespace Antmicro.Renode.Peripherals.DMA
 
             this.machine = machine;
             systemBus = machine.GetSystemBus(this);
+            machine.PeripheralsChanged += (_, __) => InvalidateMemoryMap();
             registers = new byte[SizeValue];
             channels = new ChannelState[ChannelCount];
             connections = new Dictionary<int, IGPIO>();
@@ -435,6 +436,11 @@ namespace Antmicro.Renode.Peripherals.DMA
         {
             var source = transfer.SourceAddress;
             var destination = transfer.DestinationAddress;
+            // Contiguous minor loops (the common case) need one range check per side.
+            if(transfer.SourceOffset == (int)transfer.SourceSize && transfer.DestinationOffset == (int)transfer.DestinationSize)
+            {
+                return IsMappedMemoryRange(source, transfer.NBytes) && IsMappedMemoryRange(destination, transfer.NBytes);
+            }
             for(uint position = 0; position < transfer.NBytes; position += transfer.BurstSize)
             {
                 for(uint index = 0; index < transfer.BurstSize; index += transfer.SourceSize)
@@ -459,15 +465,63 @@ namespace Antmicro.Renode.Peripherals.DMA
 
         private bool IsMappedMemoryRange(uint address, uint size)
         {
-            for(uint offset = 0; offset < size; offset++)
+            // Every byte of [address, address + size) must belong to a MappedMemory;
+            // adjacent memories may together cover the range.
+            ulong position = address;
+            ulong end = (ulong)address + size;
+            while(position < end)
             {
-                var registration = systemBus.WhatIsAt(unchecked(address + offset), this);
-                if(registration == null || !(registration.Peripheral is MappedMemory))
+                var entry = FindMappedMemory(position);
+                if(entry == null)
                 {
                     return false;
                 }
+                position = entry.Value.End;
             }
             return true;
+        }
+
+        // Sorted, cached (start, end, memory) view of the MappedMemory
+        // registrations visible to this peripheral. The bus-level WhatIsAt is a
+        // Linq scan of every registration and was called once per DMA byte.
+        private MemoryEntry? FindMappedMemory(ulong address)
+        {
+            var map = memoryMap;
+            if(map == null)
+            {
+                map = BuildMemoryMap();
+                memoryMap = map;
+            }
+            foreach(var entry in map)
+            {
+                if(address >= entry.Start && address < entry.End)
+                {
+                    return entry;
+                }
+            }
+            return null;
+        }
+
+        private MemoryEntry[] BuildMemoryMap()
+        {
+            var entries = new List<MemoryEntry>();
+            foreach(var registration in systemBus.GetRegistrationsForPeripheralType<MappedMemory>(this))
+            {
+                var range = registration.RegistrationPoint.Range;
+                entries.Add(new MemoryEntry
+                {
+                    Start = range.StartAddress,
+                    End = range.StartAddress + range.Size,
+                    Memory = (MappedMemory)registration.Peripheral,
+                });
+            }
+            entries.Sort((a, b) => a.Start.CompareTo(b.Start));
+            return entries.ToArray();
+        }
+
+        private void InvalidateMemoryMap()
+        {
+            memoryMap = null;
         }
 
         private void CompleteTransfer(int channel)
@@ -607,8 +661,8 @@ namespace Antmicro.Renode.Peripherals.DMA
 
         private bool IsSingleMemory(ulong address, uint count)
         {
-            var first = systemBus.WhatPeripheralIsAt(address, this) as MappedMemory;
-            return first != null && ReferenceEquals(first, systemBus.WhatPeripheralIsAt(address + count - 1, this));
+            var first = FindMappedMemory(address);
+            return first != null && address + count - 1 < first.Value.End;
         }
 
         private void SetInterruptPending(int channel)
@@ -755,9 +809,17 @@ namespace Antmicro.Renode.Peripherals.DMA
             public ushort ControlStatus;
         }
 
+        private struct MemoryEntry
+        {
+            public ulong Start;
+            public ulong End;
+            public MappedMemory Memory;
+        }
+
         private readonly object sync = new object();
         private readonly IMachine machine;
         private readonly IBusController systemBus;
+        private volatile MemoryEntry[] memoryMap;
         private readonly byte[] registers;
         private readonly ChannelState[] channels;
         private readonly Dictionary<int, IGPIO> connections;

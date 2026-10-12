@@ -5,6 +5,8 @@
 // Full license text is available in 'licenses/MIT.txt'.
 //
 
+using System;
+
 using Antmicro.Renode.Core;
 using Antmicro.Renode.Peripherals.Bus;
 using Antmicro.Renode.Time;
@@ -12,15 +14,19 @@ using Antmicro.Renode.Time;
 namespace Antmicro.Renode.Peripherals.Timers
 {
     // MPC56xx STM control/counter subset used by the MPC5645S startup path.
-    // The counter is scheduler-backed and advances only while CR[TEN] is set.
+    // The counter advances only while CR[TEN] is set.
+    //
+    // The count is derived from the clock source's elapsed virtual time on
+    // every access instead of being backed by a LimitTimer: the firmware reads
+    // CNT tens of thousands of times per second, and LimitTimer.Value performs
+    // a delegate-equality search of all clock entries on each read. No clock
+    // entry is needed because this subset raises no interrupt.
     public class MPC5645S_STM : IDoubleWordPeripheral, IWordPeripheral, IBytePeripheral, IKnownSize, IHasFrequency
     {
         public MPC5645S_STM(IMachine machine, ulong frequency = DefaultFrequency)
         {
             this.machine = machine;
-            timer = new LimitTimer(machine.ClockSource, frequency, this, nameof(timer),
-                limit: MaximumPeriod, direction: Direction.Ascending, enabled: false,
-                workMode: WorkMode.Periodic, eventEnabled: true, autoUpdate: false);
+            this.frequency = frequency;
             Reset();
         }
 
@@ -29,13 +35,10 @@ namespace Antmicro.Renode.Peripherals.Timers
             lock(sync)
             {
                 control = 0;
-                timer.Reset();
-                timer.AutoUpdate = false;
-                timer.EventEnabled = true;
-                timer.Limit = MaximumPeriod;
-                timer.Value = 0;
-                timer.Divider = 1;
-                timer.Enabled = false;
+                divider = 1;
+                running = false;
+                baseCount = 0;
+                baseTicks = 0;
             }
         }
 
@@ -73,8 +76,15 @@ namespace Antmicro.Renode.Peripherals.Timers
 
         public ulong Frequency
         {
-            get => timer.Frequency;
-            set => timer.Frequency = value;
+            get => frequency;
+            set
+            {
+                lock(sync)
+                {
+                    Rebase();
+                    frequency = value;
+                }
+            }
         }
 
         public long Size => 0x4000;
@@ -89,7 +99,7 @@ namespace Antmicro.Renode.Peripherals.Timers
                         return control;
                     case CountOffset:
                         SynchronizeCurrentCpuTime();
-                        return (uint)timer.Value;
+                        return Count(NowTicks());
                     default:
                         return 0;
                 }
@@ -132,17 +142,45 @@ namespace Antmicro.Renode.Peripherals.Timers
                 switch(offset)
                 {
                     case ControlOffset:
+                        SynchronizeCurrentCpuTime();
+                        // Count up to this instant with the old divider, then switch.
+                        Rebase();
                         control = Merge(control, value, mask) & ControlWritableMask;
-                        timer.Divider = ((control & CounterPrescalerMask) >> CounterPrescalerShift) + 1u;
-                        timer.Enabled = (control & TimerEnableMask) != 0;
+                        divider = ((control & CounterPrescalerMask) >> CounterPrescalerShift) + 1u;
+                        running = (control & TimerEnableMask) != 0;
                         break;
                     case CountOffset:
                         SynchronizeCurrentCpuTime();
-                        var current = (uint)timer.Value;
-                        timer.Value = Merge(current, value, mask);
+                        var now = NowTicks();
+                        baseCount = Merge(Count(now), value, mask);
+                        baseTicks = now;
                         break;
                 }
             }
+        }
+
+        // Makes the current instant the reference point for the count.
+        private void Rebase()
+        {
+            var now = NowTicks();
+            baseCount = Count(now);
+            baseTicks = now;
+        }
+
+        // Counter value at the given virtual-time tick (wraps at 32 bits like the hardware).
+        private uint Count(ulong nowTicks)
+        {
+            if(!running)
+            {
+                return baseCount;
+            }
+            var elapsed = (UInt128)(nowTicks - baseTicks) * frequency / (TimeInterval.TicksPerSecond * divider);
+            return unchecked(baseCount + (uint)(ulong)elapsed);
+        }
+
+        private ulong NowTicks()
+        {
+            return machine.ClockSource.CurrentValue.Ticks;
         }
 
         private void SynchronizeCurrentCpuTime()
@@ -160,11 +198,14 @@ namespace Antmicro.Renode.Peripherals.Timers
 
         private readonly object sync = new object();
         private readonly IMachine machine;
-        private readonly LimitTimer timer;
+        private ulong frequency;
         private uint control;
+        private uint divider;
+        private bool running;
+        private uint baseCount;
+        private ulong baseTicks;
 
         private const ulong DefaultFrequency = 40000000;
-        private const ulong MaximumPeriod = 1UL << 32;
         private const long ControlOffset = 0x0;
         private const long CountOffset = 0x4;
         private const uint TimerEnableMask = 1u << 0;

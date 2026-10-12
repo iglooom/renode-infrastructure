@@ -228,6 +228,15 @@ namespace Antmicro.Renode.Peripherals.Timers
         {
             lock(sync)
             {
+                if(IsNoOpWrite(offset, value, mask))
+                {
+                    // Some firmware rewrites an unchanged MCR/LDVAL/TCTRL set tens
+                    // of thousands of times per second from its main loop. Nothing
+                    // observable changes, so skip the CPU time sync and catch-up:
+                    // pending expiries are still applied by the armed alarm or by
+                    // the next effective access.
+                    return;
+                }
                 // Every write first applies expiries up to the current
                 // instruction: a TFLG clear or LDVAL change must not be
                 // ordered before an expiry that already happened.
@@ -294,6 +303,33 @@ namespace Antmicro.Renode.Peripherals.Timers
                         break;
                 }
                 UpdateAlarm(channelIndex, now);
+            }
+        }
+
+        // True when the write leaves every register and run state unchanged.
+        private bool IsNoOpWrite(long offset, uint value, uint mask)
+        {
+            if(offset == ModuleControlOffset)
+            {
+                return (Merge(moduleControl, value, mask) & ModuleControlWritableMask) == moduleControl;
+            }
+            if(!TryDecodeChannel(offset, out var channelIndex, out var registerOffset))
+            {
+                return true;
+            }
+            var channel = channels[channelIndex];
+            switch(registerOffset)
+            {
+                case LoadValueOffset:
+                    return Merge(channel.LoadValue, value, mask) == channel.LoadValue;
+                case CurrentValueOffset:
+                    return true;
+                case ControlOffset:
+                    return (Merge(channel.Control, value, mask) & ControlWritableMask) == channel.Control;
+                case FlagOffset:
+                    return (value & mask & InterruptFlagMask) == 0;
+                default:
+                    return true;
             }
         }
 
